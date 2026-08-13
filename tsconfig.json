@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "skipLibCheck": true,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "noEmit": true
+  },
+  "include": [
+    "App.tsx",
+    "src/admin/**/*.ts",
+    "src/admin/**/*.tsx",
+    "src/content/**/*.ts",
+    "src/lib/**/*.ts",
+    "src/native/**/*.ts",
+    "src/native/**/*.tsx"
+  ],
+  "extends": "expo/tsconfig.base"
+}

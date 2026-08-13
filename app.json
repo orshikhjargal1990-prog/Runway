@@ -1,0 +1,40 @@
+{
+  "expo": {
+    "name": "running-tracker-app",
+    "slug": "running-tracker-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "scheme": "running-tracker-app",
+    "splash": {
+      "backgroundColor": "#05070d",
+      "resizeMode": "contain"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.runningtrackerapp",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "running-tracker-app гүйлтийн зай болон маршрутыг бичихийн тулд таны байршлыг ашиглана.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "Гүйлт үргэлжилж байх үед апп хаалттай байсан ч зай, маршрутыг хэмжихийн тулд таны байршлыг ашиглана.",
+        "UIBackgroundModes": ["location"],
+        "NSPhotoLibraryUsageDescription": "running-tracker-app нийтлэлд зураг, бичлэг нэмэхийн тулд таны зурагт хандана."
+      }
+    },
+    "android": {
+      "package": "com.runningtrackerapp",
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_LOCATION",
+        "POST_NOTIFICATIONS"
+      ]
+    },
+    "plugins": [
+      "expo-location",
+      "expo-notifications",
+      "expo-image-picker"
+    ]
+  }
+}
