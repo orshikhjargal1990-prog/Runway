@@ -9,6 +9,7 @@ type Props = {
   post: Post;
   currentUserId?: string | null;
   onSocialChange?: (postId: string, patch: Partial<Pick<Post, 'likeCount' | 'commentCount' | 'likedByMe' | 'isFollowing'>>) => void;
+  onOpenAuthor?: (post: Post) => void;
 };
 
 function VideoMedia({ uri, mode }: { uri: string; mode: 'card' | 'full' }) {
@@ -56,7 +57,7 @@ function Media({ item, mode }: { item: MediaItem; mode: 'card' | 'full' }) {
   );
 }
 
-export function PostCard({ post, currentUserId, onSocialChange }: Props) {
+export function PostCard({ post, currentUserId, onSocialChange, onOpenAuthor }: Props) {
   const [galleryOpen, setGalleryOpen] = useState(false);
   const [commentsOpen, setCommentsOpen] = useState(false);
   const [comments, setComments] = useState<PostComment[]>([]);
@@ -161,17 +162,24 @@ export function PostCard({ post, currentUserId, onSocialChange }: Props) {
       onLayout={event => setCardWidth(Math.round(event.nativeEvent.layout.width))}
     >
       <View style={styles.header}>
-        {post.userAvatar ? (
-          <Image source={{ uri: post.userAvatar }} style={styles.avatarImage} />
-        ) : (
-          <View style={[styles.avatar, { backgroundColor: post.isMe ? colors.primary : colors.secondary }]}> 
-            <Text style={styles.avatarText}>{post.user.charAt(0)}</Text>
+        <Pressable
+          accessibilityLabel={`${post.user} профайл харах`}
+          disabled={!onOpenAuthor}
+          style={styles.authorButton}
+          onPress={() => onOpenAuthor?.(post)}
+        >
+          {post.userAvatar ? (
+            <Image source={{ uri: post.userAvatar }} style={styles.avatarImage} />
+          ) : (
+            <View style={[styles.avatar, { backgroundColor: post.isMe ? colors.primary : colors.secondary }]}>
+              <Text style={styles.avatarText}>{post.user.charAt(0)}</Text>
+            </View>
+          )}
+          <View style={styles.headerIdentity}>
+            <Text style={styles.user}>{post.user}</Text>
+            <Text style={styles.time}>{post.time}{post.distanceKm ? ` · ${post.distanceKm} км` : ''}</Text>
           </View>
-        )}
-        <View style={styles.headerIdentity}>
-          <Text style={styles.user}>{post.user}</Text>
-          <Text style={styles.time}>{post.time}{post.distanceKm ? ` · ${post.distanceKm} км` : ''}</Text>
-        </View>
+        </Pressable>
         {!post.isMe && post.userId ? (
           <Pressable
             disabled={followSaving}
@@ -290,6 +298,7 @@ export function PostCard({ post, currentUserId, onSocialChange }: Props) {
 const styles = StyleSheet.create({
   card: { backgroundColor: 'rgba(8,25,30,0.9)', borderRadius: 16, overflow: 'hidden', borderWidth: 1, borderColor: 'rgba(220,244,248,0.3)', marginBottom: 14, shadowColor: '#02090c', shadowOpacity: 0.42, shadowRadius: 22, shadowOffset: { width: 0, height: 11 } },
   header: { flexDirection: 'row', alignItems: 'center', gap: 8, padding: 10 },
+  authorButton: { flex: 1, minWidth: 0, flexDirection: 'row', alignItems: 'center', gap: 8 },
   headerIdentity: { flex: 1, minWidth: 0 },
   avatar: { width: 32, height: 32, borderRadius: 16, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: 'rgba(255,255,255,0.46)' },
   avatarImage: { width: 32, height: 32, borderRadius: 16, borderWidth: 1.5, borderColor: 'rgba(255,255,255,0.68)', backgroundColor: '#10262D' },

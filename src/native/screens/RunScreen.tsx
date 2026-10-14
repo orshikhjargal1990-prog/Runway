@@ -1,38 +1,62 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Animated, AppState, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Alert, Animated, AppState, Modal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import * as Location from 'expo-location';
-import type { Challenge } from '../types';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import type { Challenge, MediaItem } from '../types';
+import type { ClubEvent } from '../clubs';
 import { colors } from '../theme';
 import { GoogleRouteMap } from '../components/GoogleRouteMap';
-import type { Point, RouteOption } from '../routes';
+import { RUN_ROUTES, type Point, type RouteOption } from '../routes';
 import {
   readBackgroundRunSnapshot,
   startBackgroundRunTracking,
   stopBackgroundRunTracking
 } from '../../lib/runTracking';
 
+function isSingleRunChallenge(challenge: Challenge | null) {
+  return challenge?.completionMode === 'single_run' || (!challenge?.completionMode && challenge?.group === '5k');
+}
+
 type Props = {
   activeChallenge: Challenge | null;
+  activeChallengeProgressKm?: number;
+  activeClubEvent?: ClubEvent | null;
   routes: RouteOption[];
   selectedRouteId?: string | null;
-  onOpenComposer: () => void;
+  onOpenComposer: (draft?: {
+    title?: string;
+    description?: string;
+    media?: MediaItem[];
+    runMapMedia?: MediaItem;
+  }) => void;
   onLiveRunUpdate: (run: {
-    routeId: string; routeTitle: string; distanceKm: number; durationSeconds: number;
+    routeId: string | null; routeTitle: string; distanceKm: number; durationSeconds: number;
+    clubId?: string | null; eventId?: string | null;
     latitude: number | null; longitude: number | null; startedAt: string; paused: boolean;
   }) => Promise<void>;
   onLiveRunEnd: () => Promise<void>;
+  onExitFinishedRun: () => void;
   onSaveRun: (run: {
-    routeId: string;
+    routeId: string | null;
     challengeId: string | null;
     distanceKm: number;
     durationSeconds: number;
     calories: number;
     coordinates: Point[];
     startedAt: string;
+    completedAt: string;
   }) => Promise<void>;
 };
 
 const EARTH_RADIUS_KM = 6371;
+const CUSTOM_ROUTE_ID = 'custom-route';
+const CUSTOM_ROUTE_TITLE = 'Өөрийн маршрут';
+const MAX_ACCEPTED_ACCURACY_METERS = 50;
+const MAX_FIRST_POINT_ACCURACY_METERS = 100;
+const MIN_SEGMENT_DISTANCE_METERS = 2;
+const MAX_RUNNING_SPEED_METERS_PER_SECOND = 4;
+const MAX_RUNNING_SEGMENT_SPEED_METERS_PER_SECOND = 4.8;
+type RunNotice = { title: string; message: string };
 
 function toRadians(value: number) {
   return (value * Math.PI) / 180;
@@ -60,6 +84,13 @@ function getRouteDistance(coordinates: Point[]) {
   }, 0);
 }
 
+function isValidPoint(point: Point) {
+  return Number.isFinite(point.latitude)
+    && Number.isFinite(point.longitude)
+    && Math.abs(point.latitude) <= 90
+    && Math.abs(point.longitude) <= 180;
+}
+
 function formatDuration(totalSeconds: number) {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
@@ -79,9 +110,85 @@ function formatPace(distanceKm: number, elapsedSeconds: number) {
   return `${minutes}:${String(seconds).padStart(2, '0')}`;
 }
 
-export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRouteId, onSaveRun, onLiveRunUpdate, onLiveRunEnd }: Props) {
-  const fallbackRoute = routes[0];
-  const [selectedRouteId, setSelectedRouteId] = useState(incomingRouteId ?? fallbackRoute.id);
+function escapeSvgText(value: string) {
+  return value.replace(/[&<>"']/g, character => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&apos;'
+  }[character] ?? character));
+}
+
+function createRunMapMedia(input: {
+  coordinates: Point[];
+  distanceKm: number;
+  durationSeconds: number;
+  pace: string;
+  routeTitle: string;
+}): MediaItem {
+  const width = 1200;
+  const height = 900;
+  const mapLeft = 72;
+  const mapTop = 76;
+  const mapWidth = width - 144;
+  const mapHeight = 560;
+  const coordinates = input.coordinates.length > 1 ? input.coordinates : [
+    { latitude: 47.9187, longitude: 106.9176 },
+    { latitude: 47.9192, longitude: 106.9188 }
+  ];
+  const latitudes = coordinates.map(point => point.latitude);
+  const longitudes = coordinates.map(point => point.longitude);
+  const minLatitude = Math.min(...latitudes);
+  const maxLatitude = Math.max(...latitudes);
+  const minLongitude = Math.min(...longitudes);
+  const maxLongitude = Math.max(...longitudes);
+  const latitudeRange = Math.max(0.001, maxLatitude - minLatitude);
+  const longitudeRange = Math.max(0.001, maxLongitude - minLongitude);
+  const points = coordinates.map(point => {
+    const x = mapLeft + ((point.longitude - minLongitude) / longitudeRange) * mapWidth;
+    const y = mapTop + (1 - ((point.latitude - minLatitude) / latitudeRange)) * mapHeight;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  const start = points.split(' ')[0];
+  const end = points.split(' ').at(-1) ?? start;
+  const [startX, startY] = start.split(',');
+  const [endX, endY] = end.split(',');
+  const safeTitle = escapeSvgText(input.routeTitle);
+  const svg = `
+<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#06111f"/><stop offset="0.55" stop-color="#0b1828"/><stop offset="1" stop-color="#142033"/></linearGradient>
+    <linearGradient id="route" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#39ff88"/><stop offset="1" stop-color="#06b6d4"/></linearGradient>
+    <filter id="glow"><feGaussianBlur stdDeviation="8" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  </defs>
+  <rect width="1200" height="900" fill="url(#bg)"/>
+  <path d="M120 158 H1080 M120 278 H1080 M120 398 H1080 M120 518 H1080 M240 96 V620 M420 96 V620 M600 96 V620 M780 96 V620 M960 96 V620" stroke="#ffffff" stroke-opacity="0.055" stroke-width="2"/>
+  <polyline points="${points}" fill="none" stroke="#0a1220" stroke-width="34" stroke-linecap="round" stroke-linejoin="round" opacity="0.75"/>
+  <polyline points="${points}" fill="none" stroke="url(#route)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)"/>
+  <circle cx="${startX}" cy="${startY}" r="18" fill="#06120e" stroke="#39ff88" stroke-width="8"/>
+  <circle cx="${endX}" cy="${endY}" r="24" fill="#b6ff2e" stroke="#ffffff" stroke-opacity="0.65" stroke-width="6"/>
+  <text x="72" y="704" fill="#b6ff2e" font-family="Inter, Arial, sans-serif" font-size="22" font-weight="900">RUNBOOST</text>
+  <text x="72" y="746" fill="#ffffff" font-family="Inter, Arial, sans-serif" font-size="42" font-weight="900">${safeTitle}</text>
+  <text x="72" y="790" fill="#94a3b8" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="700">Гүйлтийн мэп ба GPS зам</text>
+  <g font-family="Inter, Arial, sans-serif" font-weight="900">
+    <text x="690" y="724" fill="#94a3b8" font-size="20">ЗАЙ</text><text x="690" y="766" fill="#ffffff" font-size="40">${input.distanceKm.toFixed(2)} км</text>
+    <text x="860" y="724" fill="#94a3b8" font-size="20">ХУГАЦАА</text><text x="860" y="766" fill="#ffffff" font-size="40">${formatDuration(input.durationSeconds)}</text>
+    <text x="1040" y="724" fill="#94a3b8" font-size="20">ТЕМП</text><text x="1040" y="766" fill="#ffffff" font-size="40" text-anchor="end">${escapeSvgText(input.pace)} /км</text>
+  </g>
+</svg>`.trim();
+
+  return {
+    id: `run-map-${Date.now()}`,
+    type: 'image',
+    uri: `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`
+  };
+}
+
+export function RunScreen({ activeChallenge, activeChallengeProgressKm = 0, activeClubEvent = null, routes, selectedRouteId: incomingRouteId, onOpenComposer, onSaveRun, onLiveRunUpdate, onLiveRunEnd, onExitFinishedRun }: Props) {
+  const insets = useSafeAreaInsets();
+  const fallbackRoute = routes[0] ?? RUN_ROUTES[0];
+  const [selectedRouteId, setSelectedRouteId] = useState(incomingRouteId ?? CUSTOM_ROUTE_ID);
   const [running, setRunning] = useState(false);
   const [paused, setPaused] = useState(false);
   const [finished, setFinished] = useState(false);
@@ -92,25 +199,40 @@ export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRo
   const [mapFocusCoordinate, setMapFocusCoordinate] = useState<Point | null>(null);
   const [replayPointCount, setReplayPointCount] = useState(0);
   const [replaying, setReplaying] = useState(false);
+  const [runNotice, setRunNotice] = useState<RunNotice | null>(null);
   const liveCoordinatesRef = useRef<Point[]>([]);
   const startedAt = useRef<number | null>(null);
   const sessionStartedAt = useRef<number | null>(null);
   const elapsedTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const elapsedSecondsRef = useRef(0);
   const pausedRef = useRef(false);
+  const lastAcceptedLocation = useRef<{ point: Point; timestamp: number } | null>(null);
   const startPulse = useRef(new Animated.Value(0)).current;
   const watcher = useRef<Location.LocationSubscription | null>(null);
   const replayTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  const showRunNotice = (title: string, message: string) => setRunNotice({ title, message });
+
   const selectedRoute = useMemo(
-    () => routes.find(route => route.id === selectedRouteId) ?? fallbackRoute,
-    [fallbackRoute, routes, selectedRouteId]
+    () => routes.find(route => route.id === selectedRouteId) ?? null,
+    [routes, selectedRouteId]
   );
+  const customMapRoute = useMemo<RouteOption>(() => ({
+    ...fallbackRoute,
+    id: CUSTOM_ROUTE_ID,
+    title: CUSTOM_ROUTE_TITLE,
+    coordinates: []
+  }), [fallbackRoute]);
+  const mapRoute = selectedRoute ?? customMapRoute;
+  const selectedRouteTitle = selectedRoute?.title ?? CUSTOM_ROUTE_TITLE;
+  const selectedRouteIdForSave = selectedRoute?.id ?? null;
   const popularRoutes = useMemo(
     () => [...routes].sort((first, second) => second.recentActivities - first.recentActivities),
     [routes]
   );
-  const activityLevel = selectedRoute.recentActivities >= 200
+  const activityLevel = !selectedRoute
+    ? 'Чөлөөт GPS гүйлт'
+    : selectedRoute.recentActivities >= 200
     ? 'Маш өндөр идэвхтэй'
     : selectedRoute.recentActivities >= 80
       ? 'Идэвхтэй'
@@ -131,8 +253,10 @@ export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRo
     const publish = () => {
       const last = liveCoordinatesRef.current.at(-1);
       void onLiveRunUpdate({
-        routeId: selectedRoute.id,
-        routeTitle: selectedRoute.title,
+        routeId: selectedRouteIdForSave,
+        routeTitle: selectedRouteTitle,
+        clubId: activeClubEvent?.clubId ?? null,
+        eventId: activeClubEvent?.id ?? null,
         distanceKm: getRouteDistance(liveCoordinatesRef.current),
         durationSeconds: elapsedSecondsRef.current,
         latitude: last?.latitude ?? null,
@@ -144,7 +268,7 @@ export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRo
     publish();
     const timer = setInterval(publish, 5000);
     return () => clearInterval(timer);
-  }, [onLiveRunUpdate, running, selectedRoute.id, selectedRoute.title]);
+  }, [activeClubEvent, onLiveRunUpdate, running, selectedRouteIdForSave, selectedRouteTitle]);
 
   useEffect(
     () => () => {
@@ -164,48 +288,52 @@ export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRo
     }
   }, [incomingRouteId, selectedRouteId]);
 
+  const focusCurrentLocation = useCallback(async () => {
+    try {
+      let permission = await Location.getForegroundPermissionsAsync();
+
+      if (!permission.granted && permission.canAskAgain) {
+        permission = await Location.requestForegroundPermissionsAsync();
+      }
+
+      if (!permission.granted) {
+        return false;
+      }
+
+      const currentLocation = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.Balanced
+      });
+
+      setMapFocusCoordinate({
+        latitude: currentLocation.coords.latitude,
+        longitude: currentLocation.coords.longitude
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
 
-    const focusCurrentLocation = async () => {
-      if (incomingRouteId || running || hasFinishedRun) {
+    const focusInitialCurrentLocation = async () => {
+      if ((incomingRouteId && incomingRouteId !== CUSTOM_ROUTE_ID) || running || hasFinishedRun) {
         return;
       }
 
-      try {
-        let permission = await Location.getForegroundPermissionsAsync();
-
-        if (!permission.granted && permission.canAskAgain) {
-          permission = await Location.requestForegroundPermissionsAsync();
-        }
-
-        if (!permission.granted) {
-          return;
-        }
-
-        const currentLocation = await Location.getCurrentPositionAsync({
-          accuracy: Location.Accuracy.Balanced
-        });
-
-        if (!cancelled) {
-          setMapFocusCoordinate({
-            latitude: currentLocation.coords.latitude,
-            longitude: currentLocation.coords.longitude
-          });
-        }
-      } catch {
-        if (!cancelled) {
-          setMapFocusCoordinate(null);
-        }
+      const focused = await focusCurrentLocation();
+      if (!focused && !cancelled) {
+        setMapFocusCoordinate(null);
       }
     };
 
-    focusCurrentLocation();
+    void focusInitialCurrentLocation();
 
     return () => {
       cancelled = true;
     };
-  }, [hasFinishedRun, incomingRouteId, running]);
+  }, [focusCurrentLocation, hasFinishedRun, incomingRouteId, running]);
 
   useEffect(() => {
     const animation = Animated.loop(
@@ -253,6 +381,34 @@ export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRo
     });
   };
 
+  const appendLocationIfReliable = (location: Location.LocationObject) => {
+    const point = {
+      latitude: location.coords.latitude,
+      longitude: location.coords.longitude
+    };
+    const accuracy = location.coords.accuracy ?? Number.POSITIVE_INFINITY;
+    const timestamp = location.timestamp || Date.now();
+    const previous = lastAcceptedLocation.current;
+
+    if (!isValidPoint(point)) return;
+    if (!previous && accuracy > MAX_FIRST_POINT_ACCURACY_METERS) return;
+    if (previous && accuracy > MAX_ACCEPTED_ACCURACY_METERS) return;
+
+    if (previous) {
+      const distanceMeters = getDistanceBetweenPoints(previous.point, point) * 1000;
+      const elapsedFromPrevious = Math.max(1, (timestamp - previous.timestamp) / 1000);
+      const reportedSpeed = location.coords.speed ?? null;
+      const segmentSpeed = distanceMeters / elapsedFromPrevious;
+
+      if (distanceMeters < MIN_SEGMENT_DISTANCE_METERS) return;
+      if (reportedSpeed !== null && reportedSpeed > MAX_RUNNING_SPEED_METERS_PER_SECOND) return;
+      if (segmentSpeed > MAX_RUNNING_SEGMENT_SPEED_METERS_PER_SECOND) return;
+    }
+
+    lastAcceptedLocation.current = { point, timestamp };
+    appendLiveCoordinate(point);
+  };
+
   const beginRunSession = (initialPoint?: Point) => {
     watcher.current?.remove();
     if (elapsedTimer.current) clearInterval(elapsedTimer.current);
@@ -261,6 +417,7 @@ export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRo
     setReplaying(false);
     const initialCoordinates = initialPoint ? [initialPoint] : [];
     liveCoordinatesRef.current = initialCoordinates;
+    lastAcceptedLocation.current = initialPoint ? { point: initialPoint, timestamp: Date.now() } : null;
     setLiveCoordinates(initialCoordinates);
     setSavedRouteCoordinates([]);
     setMapFocusCoordinate(null);
@@ -280,11 +437,8 @@ export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRo
   const startLocationWatcher = async () => {
     watcher.current?.remove();
     watcher.current = await Location.watchPositionAsync(
-      { accuracy: Location.Accuracy.High, distanceInterval: 2, timeInterval: 1000 },
-      (location: Location.LocationObject) => appendLiveCoordinate({
-        latitude: location.coords.latitude,
-        longitude: location.coords.longitude
-      })
+      { accuracy: Location.Accuracy.BestForNavigation, distanceInterval: 3, timeInterval: 2000 },
+      appendLocationIfReliable
     );
   };
 
@@ -294,6 +448,9 @@ export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRo
     sessionStartedAt.current = snapshot.startedAt;
     startedAt.current = snapshot.startedAt;
     liveCoordinatesRef.current = snapshot.coordinates;
+    lastAcceptedLocation.current = snapshot.coordinates.length
+      ? { point: snapshot.coordinates[snapshot.coordinates.length - 1], timestamp: snapshot.updatedAt }
+      : null;
     setLiveCoordinates(snapshot.coordinates);
     setElapsedSeconds(Math.max(0, Math.floor((Date.now() - snapshot.startedAt) / 1000)));
     setRunning(true);
@@ -322,7 +479,7 @@ export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRo
     }
 
     if (!permissionGranted) {
-      beginRunSession(selectedRoute.center);
+      beginRunSession();
       Alert.alert('GPS хязгаарлагдмал байна', 'Байршлын зөвшөөрөлгүй тул гүйлтийг таймерын горимоор эхлүүллээ. GPS зөвшөөрвөл зай, маршрут бүрэн хэмжигдэнэ.');
       setStarting(false);
       return;
@@ -334,23 +491,21 @@ export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRo
       const currentLocation = await Location.getCurrentPositionAsync({
         accuracy: Location.Accuracy.High
       });
-      appendLiveCoordinate({
-        latitude: currentLocation.coords.latitude,
-        longitude: currentLocation.coords.longitude
-      });
+      appendLocationIfReliable(currentLocation);
 
       await startLocationWatcher();
       const backgroundStarted = await startBackgroundRunTracking({
         startedAt: sessionStartedAt.current ?? Date.now(),
-        routeId: selectedRoute.id,
-        routeTitle: selectedRoute.title,
+        routeId: selectedRouteIdForSave ?? undefined,
+        routeTitle: selectedRouteTitle,
+        clubId: activeClubEvent?.clubId,
+        eventId: activeClubEvent?.id,
         coordinates: liveCoordinatesRef.current
       });
       if (!backgroundStarted) {
         Alert.alert('Background зөвшөөрөл хэрэгтэй', 'Аппаас гарсан үед гүйлтийн мэдээллийг notification дээр харуулахын тулд байршлыг “Always allow” болгож зөвшөөрнө үү.');
       }
     } catch {
-      if (liveCoordinatesRef.current.length === 0) appendLiveCoordinate(selectedRoute.center);
       Alert.alert('GPS түр боломжгүй байна', 'Гүйлт таймерын горимоор үргэлжилж байна.');
     } finally {
       setStarting(false);
@@ -367,21 +522,26 @@ export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRo
     watcher.current?.remove();
     watcher.current = null;
     void stopBackgroundRunTracking();
+    showRunNotice('Маш бага зай үлдлээ', 'Хичээгээрэй');
   };
 
   const resumeRun = async () => {
     if (!running || !paused) return;
     setPaused(false);
-    startedAt.current = Date.now() - elapsedSeconds * 1000;
-    elapsedTimer.current = setInterval(() => {
-      if (startedAt.current) setElapsedSeconds(Math.floor((Date.now() - startedAt.current) / 1000));
-    }, 1000);
+    if (!elapsedTimer.current) {
+      startedAt.current = Date.now() - elapsedSeconds * 1000;
+      elapsedTimer.current = setInterval(() => {
+        if (startedAt.current) setElapsedSeconds(Math.floor((Date.now() - startedAt.current) / 1000));
+      }, 1000);
+    }
     try {
       await startLocationWatcher();
       await startBackgroundRunTracking({
         startedAt: sessionStartedAt.current ?? Date.now() - elapsedSeconds * 1000,
-        routeId: selectedRoute.id,
-        routeTitle: selectedRoute.title,
+        routeId: selectedRouteIdForSave ?? undefined,
+        routeTitle: selectedRouteTitle,
+        clubId: activeClubEvent?.clubId,
+        eventId: activeClubEvent?.id,
         coordinates: liveCoordinatesRef.current
       });
     } catch {
@@ -391,11 +551,12 @@ export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRo
 
   const finishRun = async () => {
     const backgroundSnapshot = await readBackgroundRunSnapshot();
-    const finishedCoordinates = backgroundSnapshot?.coordinates.length
-      ? backgroundSnapshot.coordinates
+    const finishedCoordinates = (backgroundSnapshot?.coordinates.length ?? 0) > liveCoordinatesRef.current.length
+      ? backgroundSnapshot?.coordinates ?? liveCoordinatesRef.current
       : liveCoordinatesRef.current;
     const finishedDistance = getRouteDistance(finishedCoordinates);
     const runStartedAt = sessionStartedAt.current ? new Date(sessionStartedAt.current).toISOString() : new Date().toISOString();
+    const runCompletedAt = new Date().toISOString();
     setRunning(false);
     setPaused(false);
     setFinished(true);
@@ -411,16 +572,30 @@ export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRo
     sessionStartedAt.current = null;
     setSavedRouteCoordinates(finishedCoordinates);
     setReplayPointCount(finishedCoordinates.length);
+    const singleRunChallenge = isSingleRunChallenge(activeChallenge);
+    const challengeDistance = singleRunChallenge ? finishedDistance : activeChallengeProgressKm + finishedDistance;
+    const challengeCompleted = Boolean(activeChallenge && challengeDistance >= activeChallenge.goalKm);
+    const challengeIdForSave = singleRunChallenge && !challengeCompleted ? null : activeChallenge?.id ?? null;
     try {
       await onSaveRun({
-        routeId: selectedRoute.id,
-        challengeId: activeChallenge?.id ?? null,
+        routeId: selectedRouteIdForSave,
+        challengeId: challengeIdForSave,
         distanceKm: finishedDistance,
         durationSeconds: elapsedSeconds,
         calories: Math.round(finishedDistance * 62),
         coordinates: finishedCoordinates,
-        startedAt: runStartedAt
+        startedAt: runStartedAt,
+        completedAt: runCompletedAt
       });
+      if (activeChallenge) {
+        if (challengeCompleted) {
+          showRunNotice('Баяр хүргэе', 'Та чэлленжээ амжилттай гүйцэтгэлээ. Баяр хүргэе!');
+        } else if (singleRunChallenge) {
+          showRunNotice('Таны чэллэнж биелсэнгүй', 'Гүйлтийн мэдээлэл ерөнхий үзүүлтэнд нэмэгдлээ. Дараагийн удаа илүү хичээгээрэй. Амжилт');
+        } else {
+          showRunNotice('Амжилттай бүртгэгдлээ', 'Таны гүйлт чэлленжд амжилттай бүртгэгдлээ.');
+        }
+      }
     } catch {
       Alert.alert('Гүйлт хадгалагдсангүй', 'Интернэт холболтоо шалгаад дахин оролдоно уу.');
     }
@@ -448,22 +623,38 @@ export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRo
     }, 70);
   };
 
+  const openRunPostComposer = () => {
+    const runMapMedia = createRunMapMedia({
+      coordinates: savedRouteCoordinates,
+      distanceKm: savedDistanceKm,
+      durationSeconds: elapsedSeconds,
+      pace: finishedPace,
+      routeTitle: selectedRouteTitle
+    });
+    onOpenComposer({
+      title: `${savedDistanceKm.toFixed(2)} км гүйлт`,
+      description: `${selectedRouteTitle} · ${formatDuration(elapsedSeconds)} · ${finishedPace} /км`,
+      runMapMedia
+    });
+  };
+
   const displayedMapCoordinates = hasFinishedRun
     ? savedRouteCoordinates.slice(0, Math.max(1, replayPointCount))
     : liveCoordinates;
+  const overlayTopPadding = Math.max(insets.top + 12, 58);
 
   return (
     <View style={styles.root}>
       <MapBackdrop
-        routeId={selectedRoute.id}
-        routes={routes}
+        route={mapRoute}
         liveCoordinates={displayedMapCoordinates}
         focusCoordinate={mapFocusCoordinate}
         fitRoute={hasFinishedRun}
         compactControls={hasFinishedRun}
+        showRouteInfo={Boolean(selectedRoute)}
       />
 
-      <View pointerEvents="box-none" style={styles.overlay}>
+      <View pointerEvents="box-none" style={[styles.overlay, { paddingTop: overlayTopPadding }]}>
         {running ? <View style={styles.liveHeader}><View style={[styles.liveDot, paused && styles.pausedDot]} /><Text style={styles.liveHeaderText}>{paused ? 'ГҮЙЛТ ТҮР ЗОГССОН' : 'ГҮЙЛТ ҮРГЭЛЖИЛЖ БАЙНА'}</Text></View> : null}
 
         {running ? (
@@ -491,12 +682,18 @@ export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRo
               </View>
             </View>
 
-            <View style={styles.liveRouteCard}><View><Text style={styles.liveRouteLabel}>СОНГОСОН МАРШРУТ</Text><Text style={styles.liveRouteTitle}>{selectedRoute.title}</Text></View><Text style={styles.liveRouteMeta}>{selectedRoute.distanceKm.toFixed(1)} км · {selectedRoute.difficulty}</Text></View>
+            <View style={styles.liveRouteCard}><View><Text style={styles.liveRouteLabel}>{selectedRoute ? 'СОНГОСОН МАРШРУТ' : 'ӨӨРИЙН МАРШРУТ'}</Text><Text style={styles.liveRouteTitle}>{selectedRouteTitle}</Text></View><Text style={styles.liveRouteMeta}>{selectedRoute ? `${selectedRoute.distanceKm.toFixed(1)} км · ${selectedRoute.difficulty}` : 'GPS-ээр хэмжинэ'}</Text></View>
 
             {paused ? (
               <View style={styles.pauseActions}>
-                <Pressable style={styles.resumeButton} onPress={() => void resumeRun()}><Text style={styles.resumeIcon}>▶</Text><Text style={styles.resumeText}>Үргэлжлүүлэх</Text></Pressable>
-                <Pressable style={styles.finishButton} onPress={() => void finishRun()}><Text style={styles.finishIcon}>■</Text><Text style={styles.finishText}>Гүйлт дуусгах</Text></Pressable>
+                <Pressable style={({ pressed }) => [styles.resumeButton, pressed && styles.actionButtonPressed]} onPress={() => void resumeRun()}>
+                  <View style={styles.resumeIconWrap}><Text style={styles.resumeIcon}>▶</Text></View>
+                  <Text style={styles.resumeText}>Үргэлжлүүлэх</Text>
+                </Pressable>
+                <Pressable style={({ pressed }) => [styles.finishButton, pressed && styles.actionButtonPressed]} onPress={() => void finishRun()}>
+                  <View style={styles.finishIconWrap}><Text style={styles.finishIcon}>■</Text></View>
+                  <Text style={styles.finishText}>Гүйлт дуусгах</Text>
+                </Pressable>
               </View>
             ) : (
               <Pressable style={styles.liveStopButton} onPress={pauseRun}>
@@ -508,7 +705,7 @@ export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRo
           <View pointerEvents="box-none" style={styles.finishedPanel}>
             <View style={styles.finishedSummaryCard}>
               <View style={styles.finishedHeader}>
-                <View><Text style={styles.finishedEyebrow}>ГҮЙЛТ ДУУССАН</Text><Text style={styles.finishedTitle}>Таны гүйлтийн тойм</Text><Text style={styles.finishedArea}>{selectedRoute.title}</Text></View>
+                <View><Text style={styles.finishedEyebrow}>ГҮЙЛТ ДУУССАН</Text><Text style={styles.finishedTitle}>Таны гүйлтийн тойм</Text><Text style={styles.finishedArea}>{selectedRouteTitle}</Text></View>
                 <View style={styles.finishedCheck}><Text style={styles.finishedCheckText}>✓</Text></View>
               </View>
 
@@ -531,11 +728,20 @@ export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRo
 
               <View style={styles.replayProgress}><View style={[styles.replayProgressFill, { width: `${savedRouteCoordinates.length > 0 ? (replayPointCount / savedRouteCoordinates.length) * 100 : 0}%` }]} /></View>
               <Pressable style={styles.replayButton} onPress={playRoute}><Text style={styles.replayIcon}>{replaying ? '■' : '▶'}</Text><Text style={styles.replayText}>{replaying ? 'Маршрут тоглож байна' : 'Гүйсэн маршрутыг тоглуулах'}</Text></Pressable>
-            </View>
 
-            <Pressable style={styles.startAgainButton} onPress={start}>
-              <Text style={styles.startAgainText}>ДАХИН ГҮЙХ</Text>
-            </Pressable>
+              <View style={styles.finishedActions}>
+                <Pressable style={styles.postRunButton} onPress={openRunPostComposer}>
+                  <Text style={styles.postRunIcon}>＋</Text>
+                  <Text style={styles.postRunText}>Гүйлтээ постлох</Text>
+                </Pressable>
+                <Pressable style={styles.startAgainButton} onPress={start}>
+                  <Text style={styles.startAgainText}>Дахин гүйх</Text>
+                </Pressable>
+                <Pressable style={styles.exitFinishedButton} onPress={onExitFinishedRun}>
+                  <Text style={styles.exitFinishedText}>Гарах</Text>
+                </Pressable>
+              </View>
+            </View>
           </View>
         ) : (
           <>
@@ -545,6 +751,17 @@ export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRo
               style={styles.routeScroller}
               contentContainerStyle={styles.routeRow}
             >
+              <Pressable
+                style={[styles.routeCard, styles.customRouteCard, selectedRouteId === CUSTOM_ROUTE_ID && styles.activeRouteCard]}
+                onPress={() => {
+                  setSelectedRouteId(CUSTOM_ROUTE_ID);
+                  void focusCurrentLocation();
+                }}
+              >
+                <View style={[styles.routePin, selectedRouteId === CUSTOM_ROUTE_ID && styles.activeRoutePin]} />
+                <Text style={[styles.routeTitle, selectedRouteId === CUSTOM_ROUTE_ID && styles.activeRouteText]} numberOfLines={1}>{CUSTOM_ROUTE_TITLE}</Text>
+                <Text style={styles.routeMeta}>GPS замаа өөрөө бичнэ</Text>
+              </Pressable>
               {popularRoutes.map(route => {
                 const active = route.id === selectedRouteId;
                 const popular = route.recentActivities >= 150;
@@ -566,7 +783,7 @@ export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRo
               })}
             </ScrollView>
 
-            <View style={styles.reelCard}>
+            <View pointerEvents="none" style={styles.reelCard}>
               <View style={styles.analysisHeader}>
                 <View>
                   <Text style={styles.analysisEyebrow}>МАРШРУТЫН АНАЛИЗ</Text>
@@ -575,22 +792,18 @@ export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRo
               </View>
               <View style={styles.reelStats}>
                 <View style={styles.reelStat}>
-                  <Text style={styles.reelValue}>{selectedRoute.distanceKm.toFixed(1)} км</Text>
-                  <Text style={styles.reelLabel}>замын урт</Text>
+                  <Text style={styles.reelValue}>{selectedRoute ? `${selectedRoute.distanceKm.toFixed(1)} км` : 'GPS'}</Text>
+                  <Text style={styles.reelLabel}>{selectedRoute ? 'замын урт' : 'зай хэмжилт'}</Text>
                 </View>
                 <View style={styles.reelStat}>
-                  <Text style={styles.reelValue}>{selectedRoute.liveRunners}</Text>
-                  <Text style={styles.reelLabel}>одоо гүйж байна</Text>
-                </View>
-                <View style={styles.reelStat}>
-                  <Text style={styles.reelValue}>{selectedRoute.elevationM} м</Text>
-                  <Text style={styles.reelLabel}>нийт өгсүүр</Text>
+                  <Text style={styles.reelValue}>{selectedRoute ? selectedRoute.liveRunners : '--'}</Text>
+                  <Text style={styles.reelLabel}>{selectedRoute ? 'одоо гүйж байна' : 'чөлөөт горим'}</Text>
                 </View>
               </View>
 
               <View style={styles.reelFooter}>
-                <Text style={styles.reelDetail}>{selectedRoute.area} · {selectedRoute.difficulty} · {selectedRoute.avgPace}</Text>
-                <Text style={styles.routeActivityText}>Сүүлийн үед {selectedRoute.recentActivities} гүйлт бүртгэгдсэн · {selectedRoute.estimatedDuration}</Text>
+                <Text style={styles.reelDetail}>{selectedRoute ? `${selectedRoute.area} · ${selectedRoute.difficulty} · ${selectedRoute.avgPace}` : 'Газар сонгохгүйгээр одоогийн байршлаасаа эхэлнэ'}</Text>
+                <Text style={styles.routeActivityText}>{selectedRoute ? `Сүүлийн 7 хоногт ${selectedRoute.recentActivities} гүйгч гүйсэн` : 'START дарахад таны GPS цэгүүдээр маршрут үүснэ'}</Text>
                 {activeChallenge ? <Text style={styles.challengeText}>{activeChallenge.title}</Text> : null}
               </View>
             </View>
@@ -606,25 +819,36 @@ export function RunScreen({ activeChallenge, routes, selectedRouteId: incomingRo
         )}
 
       </View>
+      <Modal visible={Boolean(runNotice)} transparent animationType="fade" onRequestClose={() => setRunNotice(null)}>
+        <View style={styles.noticeOverlay}>
+          <View style={styles.noticeCard}>
+            <Text style={styles.noticeTitle}>{runNotice?.title}</Text>
+            <Text style={styles.noticeMessage}>{runNotice?.message}</Text>
+            <Pressable style={styles.noticeButton} onPress={() => setRunNotice(null)}>
+              <Text style={styles.noticeButtonText}>Ойлголоо</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
 
-function MapBackdrop({ routeId, routes, liveCoordinates, focusCoordinate, fitRoute, compactControls }: { routeId: string; routes: RouteOption[]; liveCoordinates: Point[]; focusCoordinate?: Point | null; fitRoute?: boolean; compactControls?: boolean }) {
-  const route = routes.find(item => item.id === routeId) ?? routes[0];
-  return <GoogleRouteMap route={route} liveCoordinates={liveCoordinates} focusCoordinate={focusCoordinate ?? undefined} fitRoute={fitRoute} compactControls={compactControls} />;
+function MapBackdrop({ route, liveCoordinates, focusCoordinate, fitRoute, compactControls, showRouteInfo }: { route: RouteOption; liveCoordinates: Point[]; focusCoordinate?: Point | null; fitRoute?: boolean; compactControls?: boolean; showRouteInfo?: boolean }) {
+  return <GoogleRouteMap route={route} liveCoordinates={liveCoordinates} focusCoordinate={focusCoordinate ?? undefined} fitRoute={fitRoute} compactControls={compactControls} showRouteInfo={showRouteInfo} />;
 }
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: colors.bg },
-  overlay: { flex: 1, paddingHorizontal: 16, paddingTop: 46, backgroundColor: 'rgba(5,11,26,0.16)' },
+  overlay: { flex: 1, paddingHorizontal: 16, backgroundColor: 'rgba(5,11,26,0.16)' },
   liveHeader: { minHeight: 38, flexDirection: 'row', alignItems: 'center', gap: 7, marginBottom: 10, borderRadius: 12, paddingHorizontal: 11, backgroundColor: 'rgba(6,18,24,0.84)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.18)' },
   liveDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: colors.accent },
   pausedDot: { backgroundColor: '#FFC247' },
   liveHeaderText: { color: '#DCE8EC', fontSize: 8, fontWeight: '900' },
-  routeScroller: { height: 50, flexGrow: 0, marginBottom: 12 },
+  routeScroller: { height: 64, flexGrow: 0, marginBottom: 12 },
   routeRow: { gap: 8, paddingBottom: 0 },
   routeCard: { width: 160, height: 56, borderRadius: 16, paddingHorizontal: 11, paddingVertical: 7, backgroundColor: 'rgba(8,13,26,0.9)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.2)', shadowColor: '#000', shadowOpacity: 0.28, shadowRadius: 14 },
+  customRouteCard: { backgroundColor: 'rgba(15,31,43,0.92)' },
   activeRouteCard: { borderColor: 'rgba(57,255,136,0.75)', backgroundColor: 'rgba(15,45,33,0.92)', shadowColor: colors.primary, shadowOpacity: 0.28, shadowRadius: 14 },
   routePin: { width: 24, height: 4, borderRadius: 2, backgroundColor: colors.routeUpcoming, marginBottom: 5 },
   popularRouteBadge: { position: 'absolute', right: 8, top: 7, color: colors.accent, fontSize: 6, fontWeight: '900' },
@@ -667,14 +891,17 @@ const styles = StyleSheet.create({
   liveRouteMeta: { color: '#B4C2CC', fontSize: 9, fontWeight: '800' },
   liveStopButton: { position: 'absolute', bottom: 112, width: 86, height: 86, borderRadius: 43, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.danger, borderWidth: 6, borderColor: 'rgba(248,250,252,0.17)', shadowColor: colors.danger, shadowOpacity: 0.38, shadowRadius: 15 },
   liveStopIcon: { color: colors.text, fontSize: 22, fontWeight: '900' },
-  pauseActions: { position: 'absolute', left: 0, right: 0, bottom: 112, flexDirection: 'row', gap: 10 },
-  resumeButton: { flex: 1, height: 58, borderRadius: 17, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: colors.accent, shadowColor: colors.accent, shadowOpacity: 0.25, shadowRadius: 12 },
-  resumeIcon: { color: '#06120e', fontSize: 15, fontWeight: '900' },
-  resumeText: { color: '#06120e', fontSize: 12, fontWeight: '900' },
-  finishButton: { flex: 1, height: 58, borderRadius: 17, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: '#E84C45', borderWidth: 1, borderColor: 'rgba(255,255,255,0.2)' },
-  finishIcon: { color: '#FFFFFF', fontSize: 13, fontWeight: '900' },
+  pauseActions: { position: 'absolute', left: 0, right: 0, bottom: 108, minHeight: 70, flexDirection: 'row', alignItems: 'center', gap: 10, padding: 8, borderRadius: 24, backgroundColor: 'rgba(4,12,22,0.58)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.16)' },
+  resumeButton: { flex: 1, height: 54, borderRadius: 18, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 9, backgroundColor: 'rgba(168,255,24,0.94)', borderWidth: 1, borderColor: 'rgba(238,255,205,0.7)', shadowColor: colors.accent, shadowOpacity: 0.28, shadowRadius: 18 },
+  finishButton: { flex: 1, height: 54, borderRadius: 18, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 9, backgroundColor: 'rgba(234,67,62,0.9)', borderWidth: 1, borderColor: 'rgba(255,210,210,0.4)', shadowColor: '#E84C45', shadowOpacity: 0.2, shadowRadius: 16 },
+  actionButtonPressed: { opacity: 0.82, transform: [{ scale: 0.985 }] },
+  resumeIconWrap: { width: 26, height: 26, borderRadius: 13, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(6,18,14,0.16)' },
+  finishIconWrap: { width: 26, height: 26, borderRadius: 13, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.16)' },
+  resumeIcon: { color: '#07150f', fontSize: 12, fontWeight: '900', marginLeft: 2 },
+  finishIcon: { color: '#FFFFFF', fontSize: 10, fontWeight: '900' },
+  resumeText: { color: '#07150f', fontSize: 12, fontWeight: '900' },
   finishText: { color: '#FFFFFF', fontSize: 12, fontWeight: '900' },
-  finishedPanel: { flex: 1, justifyContent: 'flex-end', paddingBottom: 10 },
+  finishedPanel: { flex: 1, justifyContent: 'flex-end', paddingBottom: 74 },
   finishedSummaryCard: { width: '100%', borderRadius: 22, padding: 16, backgroundColor: 'rgba(5,14,24,0.95)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.2)', shadowColor: '#000', shadowOpacity: 0.4, shadowRadius: 22 },
   finishedHeader: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10 },
   finishedEyebrow: { color: colors.accent, fontSize: 7, fontWeight: '900' },
@@ -694,6 +921,18 @@ const styles = StyleSheet.create({
   replayButton: { height: 43, borderRadius: 13, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, marginTop: 10, backgroundColor: colors.accent },
   replayIcon: { color: '#06120e', fontSize: 12, fontWeight: '900' },
   replayText: { color: '#06120e', fontSize: 11, fontWeight: '900' },
-  startAgainButton: { alignSelf: 'center', marginTop: 8, paddingHorizontal: 18, height: 36, borderRadius: 18, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(6,15,28,0.88)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.24)' },
-  startAgainText: { color: colors.text, fontSize: 12, fontWeight: '900' },
+  finishedActions: { flexDirection: 'row', gap: 8, marginTop: 10 },
+  postRunButton: { flex: 1.35, height: 42, borderRadius: 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7, backgroundColor: 'rgba(255,255,255,0.1)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.2)' },
+  postRunIcon: { color: colors.accent, fontSize: 15, fontWeight: '900' },
+  postRunText: { color: colors.text, fontSize: 11, fontWeight: '900' },
+  startAgainButton: { flex: 1, height: 42, borderRadius: 14, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(6,15,28,0.88)', borderWidth: 1, borderColor: 'rgba(168,255,24,0.36)' },
+  startAgainText: { color: colors.accent, fontSize: 11, fontWeight: '900' },
+  exitFinishedButton: { flex: 0.78, height: 42, borderRadius: 14, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.08)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.18)' },
+  exitFinishedText: { color: '#DCE8EC', fontSize: 11, fontWeight: '900' },
+  noticeOverlay: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 22, backgroundColor: 'rgba(0,0,0,0.62)' },
+  noticeCard: { width: '100%', maxWidth: 420, borderRadius: 24, borderWidth: 1, borderColor: 'rgba(255,255,255,0.18)', backgroundColor: '#071016', padding: 22 },
+  noticeTitle: { color: '#FFFFFF', fontSize: 21, lineHeight: 27, fontWeight: '900', textAlign: 'center' },
+  noticeMessage: { color: 'rgba(255,255,255,0.78)', fontSize: 14, lineHeight: 21, fontWeight: '700', textAlign: 'center', marginTop: 10 },
+  noticeButton: { height: 50, borderRadius: 18, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.accent, marginTop: 20 },
+  noticeButtonText: { color: '#071016', fontSize: 15, fontWeight: '900' },
 });

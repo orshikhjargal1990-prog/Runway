@@ -4,6 +4,7 @@
     "slug": "running-tracker-app",
     "version": "1.0.0",
     "orientation": "portrait",
+    "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
     "scheme": "running-tracker-app",
     "splash": {
@@ -22,6 +23,10 @@
     },
     "android": {
       "package": "com.runningtrackerapp",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icon.png",
+        "backgroundColor": "#05070d"
+      },
       "permissions": [
         "ACCESS_FINE_LOCATION",
         "ACCESS_COARSE_LOCATION",

@@ -8,7 +8,11 @@ module.exports = {
     plugins: [...(appJson.expo.plugins || []), 'expo-video'],
     ios: {
       ...appJson.expo.ios,
-      config: googleMapsApiKey ? { googleMapsApiKey } : appJson.expo.ios?.config
+      config: {
+        ...appJson.expo.ios?.config,
+        ...(googleMapsApiKey ? { googleMapsApiKey } : {}),
+        usesNonExemptEncryption: false
+      }
     },
     android: {
       ...appJson.expo.android,
@@ -21,7 +25,11 @@ module.exports = {
     },
     extra: {
       ...appJson.expo.extra,
-      googleMapsApiKeyConfigured: Boolean(googleMapsApiKey)
+      googleMapsApiKeyConfigured: Boolean(googleMapsApiKey),
+      eas: {
+        ...appJson.expo.extra?.eas,
+        projectId: '05b0602d-f6ce-4b5e-9e50-780f8b08cbc6'
+      }
     }
   }
 };
