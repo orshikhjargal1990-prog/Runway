@@ -1,5 +1,5 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { Alert, Platform } from 'react-native';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Alert, AppState, Platform, View } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import type { Challenge, MediaItem, Post, Runner, TabKey } from './src/native/types';
@@ -12,10 +12,14 @@ import { RunScreen } from './src/native/screens/RunScreen';
 import { ExploreScreen } from './src/native/screens/ExploreScreen';
 import { ProfileScreen } from './src/native/screens/ProfileScreen';
 import { LoginScreen } from './src/native/screens/LoginScreen';
+import { compactGalleryPhotos, isStableGalleryUri } from './src/native/mediaUtils';
 import { ChallengeModal } from './src/native/components/ChallengeModal';
 import { PostComposer } from './src/native/components/PostComposer';
 import { AdminDashboard } from './src/admin/AdminDashboard';
 import { ClubAdminDashboard } from './src/club-admin/ClubAdminDashboard';
+import { getAdminChallenges } from './src/lib/adminChallengeContent';
+import { getLocalClubContentOverrides, getLocalClubEvents, getLocalDeletedClubEventIds } from './src/lib/clubAdminApi';
+import { getAdminMarathonChallenges } from './src/lib/marathonAdminContent';
 import { supabase } from './src/lib/supabase';
 import {
   createPost,
@@ -26,6 +30,7 @@ import {
   fetchPosts,
   fetchRunningClubs,
   fetchRoutes,
+  ensureUserProfile,
   joinChallenge,
   leaveChallenge,
   clearActiveRun,
@@ -34,12 +39,101 @@ import {
   setClubEventParticipation,
   setClubMembership
 } from './src/lib/runboostApi';
+import type { RunInput } from './src/lib/runboostApi';
+import { enqueuePendingRun, getPendingRunCount, syncPendingRuns } from './src/lib/pendingRunSync';
 
 type Account = {
   id: string;
   name: string;
   email: string;
 };
+
+type ComposerDraft = {
+  title?: string;
+  description?: string;
+  media?: MediaItem[];
+  runMapMedia?: MediaItem;
+};
+
+type ProfileGalleryPhoto = { id: string; uri: string };
+type ChallengeNotice = { title: string; message: string };
+
+const localJoinedClubKey = 'runboost.joinedClubId';
+const profileGalleryKey = 'runboost.profileGallery';
+
+function isSingleRunChallenge(challenge: Challenge) {
+  return challenge.completionMode === 'single_run' || (!challenge.completionMode && challenge.group === '5k');
+}
+
+function getLocalJoinedClubId() {
+  if (typeof window === 'undefined' || !window.localStorage) return null;
+  return window.localStorage.getItem(localJoinedClubKey);
+}
+
+function saveLocalJoinedClubId(clubId: string | null) {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  if (clubId) window.localStorage.setItem(localJoinedClubKey, clubId);
+  else window.localStorage.removeItem(localJoinedClubKey);
+}
+
+function addMediaToLocalProfileGallery(media: MediaItem[]) {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  const imageMedia = media.filter(item => item.type === 'image' && isStableGalleryUri(item.uri));
+  if (!imageMedia.length) return;
+  try {
+    const raw = window.localStorage.getItem(profileGalleryKey);
+    const parsed = raw ? JSON.parse(raw) as ProfileGalleryPhoto[] : [];
+    const current = Array.isArray(parsed) ? compactGalleryPhotos(parsed) : [];
+    const existingUris = new Set(current.map(photo => photo.uri));
+    const nextPhotos = imageMedia
+      .filter(item => !existingUris.has(item.uri))
+      .map(item => ({ id: `post-gallery-${item.id}-${Date.now()}`, uri: item.uri }));
+    if (!nextPhotos.length) return;
+    window.localStorage.setItem(profileGalleryKey, JSON.stringify(compactGalleryPhotos([...nextPhotos, ...current])));
+  } catch {
+    // Profile gallery is local-only; post saving should not fail if gallery sync cannot run.
+  }
+}
+
+function getInitialClubs() {
+  const overrides = getLocalClubContentOverrides();
+  const joinedClubId = getLocalJoinedClubId();
+  return DEFAULT_RUNNING_CLUBS.map(club => {
+    const local = overrides.find(item => item.clubId === club.id);
+    const next = local ? {
+      ...club,
+      image: local.imageUrl,
+      galleryImages: local.galleryImages.length ? local.galleryImages : club.galleryImages,
+      socialLinks: local.socialLinks ?? club.socialLinks
+    } : club;
+    return { ...next, joined: joinedClubId === club.id };
+  });
+}
+
+function getInitialClubEvents() {
+  const deletedEventIds = new Set(getLocalDeletedClubEventIds());
+  const localEvents = getLocalClubEvents().filter(event => !deletedEventIds.has(event.id)).map(event => ({
+    id: event.id,
+    clubId: event.clubId,
+    clubName: event.clubName,
+    title: event.title,
+    location: event.location,
+    startsAt: event.startsAt,
+    distanceKm: event.distanceKm ?? undefined,
+    image: event.imageUrl,
+    description: event.description,
+    advice: event.advice,
+    participantCount: event.participantCount
+  }));
+  const localIds = new Set(localEvents.map(event => event.id));
+  return [...localEvents, ...DEFAULT_CLUB_EVENTS.filter(event => !localIds.has(event.id) && !deletedEventIds.has(event.id))];
+}
+
+function getInitialChallenges() {
+  const adminChallenges = getAdminChallenges();
+  const adminIds = new Set(adminChallenges.map(challenge => challenge.id));
+  return [...adminChallenges, ...getAdminMarathonChallenges(), ...CHALLENGES.filter(challenge => !adminIds.has(challenge.id))];
+}
 
 export default function App() {
   if (Platform.OS === 'web' && typeof window !== 'undefined' && window.location.pathname.startsWith('/club-admin')) {
@@ -58,19 +152,27 @@ function MobileApp() {
   const [currentUser, setCurrentUser] = useState<Account | null>(null);
   const [activeTab, setActiveTab] = useState<TabKey>('home');
   const [posts, setPosts] = useState<Post[]>(INITIAL_POSTS);
-  const [challenges, setChallenges] = useState<Challenge[]>(CHALLENGES);
+  const [challenges, setChallenges] = useState<Challenge[]>(getInitialChallenges);
   const [routes, setRoutes] = useState<RouteOption[]>(RUN_ROUTES);
-  const [clubs, setClubs] = useState(DEFAULT_RUNNING_CLUBS);
-  const [clubEvents, setClubEvents] = useState(DEFAULT_CLUB_EVENTS);
+  const [clubs, setClubs] = useState<RunningClub[]>(getInitialClubs);
+  const [clubEvents, setClubEvents] = useState(getInitialClubEvents);
   const [joinedClubEventIds, setJoinedClubEventIds] = useState<string[]>([]);
   const [selectedChallenge, setSelectedChallenge] = useState<Challenge | null>(null);
   const [selectedChallengeProgressKm, setSelectedChallengeProgressKm] = useState(0);
   const [joinedChallengeIds, setJoinedChallengeIds] = useState<string[]>([]);
   const [activeChallengeId, setActiveChallengeId] = useState<string | null>(null);
+  const [activeChallengeProgressKm, setActiveChallengeProgressKm] = useState(0);
+  const [activeClubEventId, setActiveClubEventId] = useState<string | null>(null);
   const [selectedRouteId, setSelectedRouteId] = useState<string | null>(null);
   const [composerOpen, setComposerOpen] = useState(false);
+  const [composerDraft, setComposerDraft] = useState<ComposerDraft | null>(null);
+  const [profileGalleryAdditions, setProfileGalleryAdditions] = useState<MediaItem[]>([]);
+  const [profileRunAdditions, setProfileRunAdditions] = useState<RunInput[]>([]);
+  const [profileDashboardRefreshKey, setProfileDashboardRefreshKey] = useState(0);
+  const pendingRunSyncing = useRef(false);
   const [followedRunners, setFollowedRunners] = useState<string[]>([]);
   const [hiddenRunnerIds, setHiddenRunnerIds] = useState<string[]>([]);
+  const [challengeNotice, setChallengeNotice] = useState<ChallengeNotice | null>(null);
 
   useEffect(() => {
     const applySession = (session: Awaited<ReturnType<typeof supabase.auth.getSession>>['data']['session']) => {
@@ -134,23 +236,100 @@ function MobileApp() {
     [challenges, joinedChallengeIds]
   );
 
+  const refreshCurrentUserData = async () => {
+    if (!currentUser || currentUser.id === 'demo-runner') return;
+    const [
+      postResult,
+      challengeResult,
+      routeResult,
+      membershipResult,
+      clubResult,
+      eventResult,
+      clubEventMembershipResult
+    ] = await Promise.allSettled([
+      fetchPosts(currentUser.id),
+      fetchChallenges(),
+      fetchRoutes(),
+      fetchJoinedChallengeIds(currentUser.id),
+      fetchRunningClubs(currentUser.id),
+      fetchClubEvents(),
+      fetchJoinedClubEventIds(currentUser.id)
+    ]);
+    if (postResult.status === 'fulfilled') setPosts(postResult.value);
+    if (challengeResult.status === 'fulfilled' && challengeResult.value.length) setChallenges(challengeResult.value);
+    if (routeResult.status === 'fulfilled' && routeResult.value.length) setRoutes(routeResult.value);
+    if (membershipResult.status === 'fulfilled') setJoinedChallengeIds(membershipResult.value);
+    if (clubResult.status === 'fulfilled' && clubResult.value.length) setClubs(clubResult.value);
+    if (eventResult.status === 'fulfilled' && eventResult.value.length) setClubEvents(eventResult.value);
+    if (clubEventMembershipResult.status === 'fulfilled') setJoinedClubEventIds(clubEventMembershipResult.value);
+  };
+
+  useEffect(() => {
+    if (!signedIn || !currentUser || currentUser.id === 'demo-runner') return;
+
+    const syncQueuedRuns = async (showSyncedNotice = false) => {
+      if (pendingRunSyncing.current) return;
+      pendingRunSyncing.current = true;
+      try {
+        const syncedCount = await syncPendingRuns(saveRun, currentUser.id);
+        if (syncedCount > 0) {
+          setProfileDashboardRefreshKey(current => current + 1);
+          await refreshCurrentUserData();
+          if (showSyncedNotice) {
+            Alert.alert('Гүйлт sync хийгдлээ', `${syncedCount} хадгалагдсан гүйлт Supabase руу илгээгдлээ.`);
+          }
+        }
+      } finally {
+        pendingRunSyncing.current = false;
+      }
+    };
+
+    void syncQueuedRuns();
+    const interval = setInterval(() => {
+      void syncQueuedRuns(true);
+    }, 20000);
+    const subscription = AppState.addEventListener('change', state => {
+      if (state === 'active') void syncQueuedRuns(true);
+    });
+
+    return () => {
+      clearInterval(interval);
+      subscription.remove();
+    };
+  }, [currentUser, signedIn]);
+
+  const getJoinedIdsAfterRegister = (ids: string[], challenge: Challenge) => {
+    const withoutSameGroup = ids.filter(id => {
+      const existing = challenges.find(item => item.id === id);
+      return existing?.group !== challenge.group;
+    });
+    return withoutSameGroup.includes(challenge.id) ? withoutSameGroup : [...withoutSameGroup, challenge.id];
+  };
+
+  const showChallengeRegistrationSuccess = () => {
+    setChallengeNotice({
+      title: 'Та амжилттай бүртгүүллээ',
+      message: 'Гүйлтээ профайл хуудасны чэллэнжээс эхлүүлнэ үү.'
+    });
+  };
+
   const registerChallenge = async (challenge: Challenge) => {
+    const previousJoinedIds = joinedChallengeIds;
+    setJoinedChallengeIds(current => getJoinedIdsAfterRegister(current, challenge));
+    setSelectedChallenge(challenge);
+
     if (currentUser && currentUser.id !== 'demo-runner') {
       try {
         await joinChallenge(currentUser.id, challenge);
       } catch (error) {
+        setJoinedChallengeIds(previousJoinedIds);
         Alert.alert('Бүртгэж чадсангүй', error instanceof Error ? error.message : 'Supabase холболт болон интернэтээ шалгана уу.');
         return;
       }
     }
-    setJoinedChallengeIds(prev => {
-      const withoutSameGroup = prev.filter(id => {
-        const existing = challenges.find(item => item.id === id);
-        return existing?.group !== challenge.group;
-      });
-      return withoutSameGroup.includes(challenge.id) ? withoutSameGroup : [...withoutSameGroup, challenge.id];
-    });
-    setSelectedChallenge(challenge);
+    setProfileDashboardRefreshKey(current => current + 1);
+    void refreshCurrentUserData();
+    showChallengeRegistrationSuccess();
   };
 
   const handleRegisterChallenge = (challenge: Challenge) => {
@@ -164,16 +343,10 @@ function MobileApp() {
     );
 
     if (sameGroup) {
-      const groupLabel = challenge.group === '5k' ? '5 км' : '10 км';
-      Alert.alert(
-        `${groupLabel} чэлленж идэвхтэй байна`,
-        `Та “${sameGroup.title}” чэлленжид оролцож байна. Нэг хэрэглэгч ${groupLabel} ангилалд нэг л идэвхтэй чэлленжтэй байна. Эхлээд өмнөхөө дуусгах эсвэл түүнээс гараад “${challenge.title}”-д бүртгүүлнэ үү.`,
-        [
-          { text: 'Болих', style: 'cancel' },
-          { text: 'Өмнөхийг нээх', onPress: () => setSelectedChallenge(sameGroup) },
-          { text: 'Гараад бүртгүүлэх', style: 'destructive', onPress: () => void registerChallenge(challenge) }
-        ]
-      );
+      setChallengeNotice({
+        title: 'Өөр чэллэнжид бүртгэлтэй байна',
+        message: `Та “${sameGroup.title}” чэллэнжид бүртгэлтэй байна. Тухайн чэллэнжээ дуусгасны дараа “${challenge.title}”-д бүртгүүлнэ үү.`
+      });
       return;
     }
 
@@ -181,37 +354,32 @@ function MobileApp() {
   };
 
   const handleLeaveChallenge = async (challenge: Challenge) => {
+    const previousJoinedIds = joinedChallengeIds;
+    setJoinedChallengeIds(current => current.filter(id => id !== challenge.id));
+    if (activeChallengeId === challenge.id) {
+      setActiveChallengeId(null);
+      setActiveChallengeProgressKm(0);
+      setActiveClubEventId(null);
+    }
+    setSelectedChallenge(null);
+    setSelectedChallengeProgressKm(0);
+
     if (currentUser && currentUser.id !== 'demo-runner') {
       try {
         await leaveChallenge(currentUser.id, challenge.id);
       } catch (error) {
+        setJoinedChallengeIds(previousJoinedIds);
         Alert.alert('Чэлленжээс гарч чадсангүй', error instanceof Error ? error.message : 'Интернэт холболтоо шалгана уу.');
         return;
       }
     }
-    setJoinedChallengeIds(current => current.filter(id => id !== challenge.id));
-    if (activeChallengeId === challenge.id) setActiveChallengeId(null);
-    setSelectedChallenge(null);
-    setSelectedChallengeProgressKm(0);
+    setProfileDashboardRefreshKey(current => current + 1);
+    void refreshCurrentUserData();
   };
 
   const handleToggleClubMembership = async (club: RunningClub) => {
     const nextJoined = !club.joined;
-    const currentClub = clubs.find(item => item.joined && item.id !== club.id);
-
-    if (nextJoined && currentClub) {
-      Alert.alert(
-        'Үндсэн клубээ солих уу?',
-        `Та одоогоор “${currentClub.name}” клубын гишүүн байна. “${club.name}” клубт нэгдэхэд өмнөх клубээс автоматаар гарна. Бусад клубын арга хэмжээнд оролцох боломж хэвээр байна.`,
-        [
-          { text: 'Болих', style: 'cancel' },
-          { text: 'Клуб солих', onPress: () => void updateClubMembership(club, true) }
-        ]
-      );
-      return;
-    }
-
-    await updateClubMembership(club, nextJoined);
+    return updateClubMembership(club, nextJoined);
   };
 
   const updateClubMembership = async (club: RunningClub, nextJoined: boolean) => {
@@ -219,8 +387,7 @@ function MobileApp() {
       try {
         await setClubMembership(currentUser.id, club.id, nextJoined);
       } catch {
-        Alert.alert('Клубын төлөв шинэчлэгдсэнгүй', 'Supabase холболт болон интернэтээ шалгана уу.');
-        return;
+        Alert.alert('Клубын төлөв local горимд хадгалагдлаа', 'Supabase холболт амжилтгүй байсан тул энэ төхөөрөмж дээр түр хадгаллаа.');
       }
     }
     setClubs(current => current.map(item => {
@@ -236,6 +403,9 @@ function MobileApp() {
       }
       return item;
     }));
+    saveLocalJoinedClubId(nextJoined ? club.id : null);
+    void refreshCurrentUserData();
+    return true;
   };
 
   const handleToggleClubEventParticipation = async (event: ClubEvent) => {
@@ -244,8 +414,7 @@ function MobileApp() {
       try {
         await setClubEventParticipation(currentUser.id, event.id, participating);
       } catch {
-        Alert.alert('Оролцох төлөв шинэчлэгдсэнгүй', 'Supabase холболт болон интернэтээ шалгана уу.');
-        return;
+        Alert.alert('Арга хэмжээний бүртгэл local горимд хадгалагдлаа', 'Supabase холболт амжилтгүй байсан тул энэ төхөөрөмж дээр түр хадгаллаа.');
       }
     }
     setJoinedClubEventIds(current => participating ? [...current, event.id] : current.filter(id => id !== event.id));
@@ -253,35 +422,54 @@ function MobileApp() {
       ...item,
       participantCount: Math.max(0, item.participantCount + (participating ? 1 : -1))
     } : item));
+    void refreshCurrentUserData();
+    return true;
   };
 
   const handleSavePost = async (title: string, description: string, media: MediaItem[]) => {
+    const galleryMedia = media.filter(item => item.type === 'image');
+    const addLocalPost = () => {
+      setPosts(prev => [{
+        id: `post-${Date.now()}`,
+        userId: currentUser?.id,
+        user: currentUser?.name ?? 'Төгөлдөр',
+        isMe: true,
+        title,
+        description,
+        media,
+        time: 'Яг одоо',
+        distanceKm: 0,
+        duration: '00:00'
+      }, ...prev]);
+      addMediaToLocalProfileGallery(galleryMedia);
+      setProfileGalleryAdditions(current => [...galleryMedia, ...current]);
+      setComposerOpen(false);
+      setComposerDraft(null);
+      setActiveTab('home');
+    };
     if (currentUser && currentUser.id !== 'demo-runner') {
       try {
+        await ensureUserProfile(currentUser.id, currentUser.name, currentUser.email);
         await createPost({ userId: currentUser.id, title, description, media });
+        addMediaToLocalProfileGallery(galleryMedia);
+        setProfileGalleryAdditions(current => [...galleryMedia, ...current]);
         setPosts(await fetchPosts(currentUser.id));
         setComposerOpen(false);
+        setComposerDraft(null);
         setActiveTab('home');
         return;
-      } catch {
-        Alert.alert('Нийтлэл хадгалагдсангүй', 'Supabase хүснэгт, Storage болон интернэт холболтоо шалгана уу.');
+      } catch (error) {
+        console.error('createPost failed', error);
+        addLocalPost();
+        Alert.alert(
+          'Нийтлэл local хадгалагдлаа',
+          `Supabase руу илгээж чадсангүй: ${error instanceof Error ? error.message : 'хүснэгт, Storage болон интернэт холболтоо шалгана уу.'}`
+        );
         return;
       }
     }
 
-    setPosts(prev => [{
-      id: `post-${Date.now()}`,
-      user: currentUser?.name ?? 'Төгөлдөр',
-      isMe: true,
-      title,
-      description,
-      media,
-      time: 'Яг одоо',
-      distanceKm: 0,
-      duration: '00:00'
-    }, ...prev]);
-    setComposerOpen(false);
-    setActiveTab('home');
+    addLocalPost();
   };
 
   const visibleRunners: Runner[] = RUNNERS.filter(runner => !hiddenRunnerIds.includes(runner.id));
@@ -289,7 +477,22 @@ function MobileApp() {
   const signIn = (account: Account) => {
     setCurrentUser(account);
     setSignedIn(true);
+    setProfileRunAdditions([]);
     setActiveTab('home');
+  };
+
+  const signOut = async () => {
+    await supabase.auth.signOut();
+    setCurrentUser(null);
+    setSignedIn(false);
+    setActiveTab('home');
+    setJoinedChallengeIds([]);
+    setJoinedClubEventIds([]);
+    setActiveChallengeId(null);
+    setActiveChallengeProgressKm(0);
+    setActiveClubEventId(null);
+    setSelectedChallenge(null);
+    setProfileRunAdditions([]);
   };
 
   if (!authReady) {
@@ -301,32 +504,58 @@ function MobileApp() {
       <StatusBar style="light" />
       {!signedIn ? (
         <LoginScreen
-          onQuickLogin={() => signIn({ id: 'demo-runner', name: 'Төгөлдөр', email: 'runner@example.com' })}
           onLogin={async (email, password) => {
-            const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+            const normalizedEmail = email.trim().toLowerCase();
+            const { data, error } = await supabase.auth.signInWithPassword({ email: normalizedEmail, password });
 
             if (error || !data.user) {
               return { ok: false, message: 'Имэйл эсвэл нууц үг буруу байна.' };
             }
 
+            const userName = typeof data.user.user_metadata.name === 'string' ? data.user.user_metadata.name : 'Гүйгч';
+            try {
+              await ensureUserProfile(data.user.id, userName, normalizedEmail);
+            } catch {
+              return { ok: false, message: 'Профайл бүртгэлийг баазад хадгалж чадсангүй.' };
+            }
+            signIn({ id: data.user.id, name: userName, email: normalizedEmail });
             return { ok: true };
           }}
           onRegister={async (name, email, password) => {
             const normalizedEmail = email.trim().toLowerCase();
+            const normalizedName = name.trim();
             const { data, error } = await supabase.auth.signUp({
               email: normalizedEmail,
               password,
-              options: { data: { name: name.trim() } }
+              options: { data: { name: normalizedName } }
             });
 
             if (error) {
               return { ok: false, message: error.message };
             }
 
+            let user = data.user;
             if (!data.session) {
-              return { ok: false, message: 'Имэйлээр ирсэн холбоосоор бүртгэлээ баталгаажуулна уу.' };
+              const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
+                email: normalizedEmail,
+                password
+              });
+              if (signInError || !signInData.user) {
+                return { ok: false, message: 'Бүртгэл үүссэн ч шууд нэвтэрч чадсангүй. Supabase Auth дээр Confirm email тохиргоог унтраана уу.' };
+              }
+              user = signInData.user;
             }
 
+            if (!user) {
+              return { ok: false, message: 'Бүртгэл үүсгэж чадсангүй.' };
+            }
+
+            try {
+              await ensureUserProfile(user.id, normalizedName, normalizedEmail);
+            } catch {
+              return { ok: false, message: 'Бүртгэлийг баазад хадгалж чадсангүй.' };
+            }
+            signIn({ id: user.id, name: normalizedName || 'Гүйгч', email: normalizedEmail });
             return { ok: true };
           }}
         />
@@ -334,8 +563,11 @@ function MobileApp() {
         <Shell
           activeTab={activeTab}
           onTabChange={tab => {
-            if (tab === 'run') {
+            if (tab === 'run' && Platform.OS !== 'web') {
               setSelectedRouteId(null);
+              setActiveChallengeId(null);
+              setActiveChallengeProgressKm(0);
+              setActiveClubEventId(null);
             }
             setActiveTab(tab);
           }}
@@ -352,11 +584,17 @@ function MobileApp() {
               runners={visibleRunners}
               followedRunnerIds={followedRunners}
               joinedChallengeIds={joinedChallengeIds}
-              onOpenComposer={() => setComposerOpen(true)}
+              onOpenComposer={() => {
+                setComposerDraft(null);
+                setComposerOpen(true);
+              }}
               onOpenChallenge={setSelectedChallenge}
               onRegisterChallenge={handleRegisterChallenge}
               onOpenRoute={routeId => {
                 setSelectedRouteId(routeId);
+                setActiveChallengeId(null);
+                setActiveChallengeProgressKm(0);
+                setActiveClubEventId(null);
                 setActiveTab('run');
               }}
               onToggleClubMembership={handleToggleClubMembership}
@@ -381,9 +619,14 @@ function MobileApp() {
           {activeTab === 'run' && (
             <RunScreen
               activeChallenge={challenges.find(challenge => challenge.id === activeChallengeId) ?? null}
+              activeChallengeProgressKm={activeChallengeProgressKm}
+              activeClubEvent={clubEvents.find(event => event.id === activeClubEventId) ?? null}
               routes={routes}
               selectedRouteId={selectedRouteId}
-              onOpenComposer={() => setComposerOpen(true)}
+              onOpenComposer={draft => {
+                setComposerDraft(draft ?? null);
+                setComposerOpen(true);
+              }}
               onLiveRunUpdate={async run => {
                 if (!currentUser || currentUser.id === 'demo-runner') return;
                 await updateActiveRun({ ...run, userId: currentUser.id });
@@ -392,17 +635,46 @@ function MobileApp() {
                 if (!currentUser || currentUser.id === 'demo-runner') return;
                 await clearActiveRun(currentUser.id);
               }}
+              onExitFinishedRun={() => {
+                setSelectedRouteId(null);
+                setActiveChallengeId(null);
+                setActiveChallengeProgressKm(0);
+                setActiveClubEventId(null);
+                setActiveTab('home');
+              }}
               onSaveRun={async (run: {
-                routeId: string;
+                routeId: string | null;
                 challengeId: string | null;
                 distanceKm: number;
                 durationSeconds: number;
                 calories: number;
                 coordinates: Point[];
                 startedAt: string;
+                completedAt: string;
               }) => {
-                if (!currentUser || currentUser.id === 'demo-runner') return;
-                await saveRun({ ...run, userId: currentUser.id });
+                if (!currentUser || currentUser.id === 'demo-runner') {
+                  setActiveChallengeId(null);
+                  setActiveChallengeProgressKm(0);
+                  setActiveClubEventId(null);
+                  return;
+                }
+                const runInput: RunInput = { ...run, userId: currentUser.id };
+                try {
+                  await saveRun(runInput);
+                } catch (error) {
+                  await enqueuePendingRun(runInput);
+                  const pendingCount = await getPendingRunCount(currentUser.id);
+                  Alert.alert(
+                    'Гүйлт local хадгалагдлаа',
+                    `Интернэтгүй байна. ${pendingCount} гүйлт хүлээгдэж байна, сүлжээ ормогц автоматаар Supabase руу илгээгдэнэ.`
+                  );
+                }
+                setProfileRunAdditions(current => [runInput, ...current].slice(0, 20));
+                setActiveChallengeId(null);
+                setActiveChallengeProgressKm(0);
+                setActiveClubEventId(null);
+                setProfileDashboardRefreshKey(current => current + 1);
+                await refreshCurrentUserData().catch(() => undefined);
               }}
             />
           )}
@@ -420,11 +692,42 @@ function MobileApp() {
               currentUserName={currentUser?.name ?? 'Гүйгч'}
               posts={posts.filter(post => post.isMe)}
               joinedChallenges={joinedChallenges}
+              joinedClub={clubs.find(club => club.joined) ?? null}
+              clubEvents={clubEvents}
               joinedClubEvents={clubEvents.filter(event => joinedClubEventIds.includes(event.id))}
+              routes={routes}
+              galleryAdditions={profileGalleryAdditions}
+              savedRunAdditions={profileRunAdditions}
+              dashboardRefreshKey={profileDashboardRefreshKey}
               onOpenChallenge={(challenge, progressKm) => {
                 setSelectedChallengeProgressKm(progressKm);
                 setSelectedChallenge(challenge);
               }}
+              onStartChallengeRun={(challenge, progressKm) => {
+                setActiveChallengeId(challenge.id);
+                setActiveChallengeProgressKm(progressKm);
+                setActiveClubEventId(null);
+                setSelectedRouteId(null);
+                setActiveTab('run');
+              }}
+              onStartClubEventRun={event => {
+                setActiveChallengeId(null);
+                setActiveChallengeProgressKm(0);
+                setActiveClubEventId(event.id);
+                setSelectedRouteId(null);
+                setActiveTab('run');
+              }}
+              onCancelChallenge={challenge => void handleLeaveChallenge(challenge)}
+              onCancelClubEvent={event => {
+                if (joinedClubEventIds.includes(event.id)) {
+                  void handleToggleClubEventParticipation(event);
+                }
+              }}
+              onRegisterClubEvent={async event => {
+                if (joinedClubEventIds.includes(event.id)) return true;
+                return handleToggleClubEventParticipation(event);
+              }}
+              onLogout={() => void signOut()}
             />
           )}
         </Shell>
@@ -436,26 +739,19 @@ function MobileApp() {
           progressKm={selectedChallengeProgressKm}
           isJoined={joinedChallengeIds.includes(selectedChallenge.id)}
           isStarted={joinedChallengeIds.includes(selectedChallenge.id)}
+          notice={challengeNotice}
+          onNoticeClose={() => setChallengeNotice(null)}
           onClose={() => {
             setSelectedChallenge(null);
             setSelectedChallengeProgressKm(0);
+            setChallengeNotice(null);
           }}
           onRegister={handleRegisterChallenge}
-          onLeave={challenge => {
-            const completed = selectedChallengeProgressKm >= challenge.goalKm;
-            Alert.alert(
-              completed ? 'Чэлленж дуусгах уу?' : 'Чэлленжээс гарах уу?',
-              completed
-                ? `“${challenge.title}” зорилго биелсэн байна. Дуусгасны дараа энэ ангиллын өөр чэлленжид бүртгүүлэх боломжтой.`
-                : `“${challenge.title}”-ээс гарсны дараа ${challenge.group === '5k' ? '5 км' : '10 км'} ангиллын өөр чэлленжид бүртгүүлэх боломжтой.`,
-              [
-                { text: 'Болих', style: 'cancel' },
-                { text: completed ? 'Дуусгах' : 'Гарах', style: 'destructive', onPress: () => void handleLeaveChallenge(challenge) }
-              ]
-            );
-          }}
+          onLeave={challenge => void handleLeaveChallenge(challenge)}
           onStartRun={challenge => {
             setActiveChallengeId(challenge.id);
+            setActiveChallengeProgressKm(isSingleRunChallenge(challenge) ? 0 : selectedChallengeProgressKm);
+            setActiveClubEventId(null);
             setSelectedChallenge(null);
             setSelectedChallengeProgressKm(0);
             setActiveTab('run');
@@ -465,10 +761,18 @@ function MobileApp() {
 
       {signedIn && composerOpen && (
         <PostComposer
-          onCancel={() => setComposerOpen(false)}
+          initialTitle={composerDraft?.title}
+          initialDescription={composerDraft?.description}
+          initialMedia={composerDraft?.media}
+          runMapMedia={composerDraft?.runMapMedia}
+          onCancel={() => {
+            setComposerOpen(false);
+            setComposerDraft(null);
+          }}
           onSave={handleSavePost}
         />
       )}
+
     </SafeAreaProvider>
   );
 }
