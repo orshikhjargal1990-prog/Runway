@@ -2,7 +2,11 @@ import type { LoginSlide } from '../content/loginSlides';
 import type { Point, RouteOption } from '../native/routes';
 import type { ClubEvent, RunningClub } from '../native/clubs';
 import type { Challenge, MediaItem, Post, PostComment } from '../native/types';
+import { getLocalClubContentOverrides, getLocalClubEvents, getLocalDeletedClubEventIds } from './clubAdminApi';
+import { getAdminChallenges } from './adminChallengeContent';
+import { getAdminMarathonChallenges } from './marathonAdminContent';
 import { supabase } from './supabase';
+import * as FileSystem from 'expo-file-system/legacy';
 
 type ChallengeRow = {
   id: string;
@@ -10,12 +14,25 @@ type ChallengeRow = {
   org: string;
   type: Challenge['type'];
   challenge_group: Challenge['group'];
+  completion_mode?: Challenge['completionMode'] | null;
   goal_km: number | string;
   reward: string | null;
   color: string;
   image_url: string;
+  description?: string | null;
+  registration_info?: string | null;
+  organizer_info?: string | null;
+  reward_info?: string | null;
   registration_ends_at: string;
 };
+
+function defaultChallengeCompletionMode(group: Challenge['group']): NonNullable<Challenge['completionMode']> {
+  return group === '5k' ? 'single_run' : 'cumulative';
+}
+
+function challengeCompletionMode(challenge: Pick<Challenge, 'group' | 'completionMode'>): NonNullable<Challenge['completionMode']> {
+  return challenge.completionMode ?? defaultChallengeCompletionMode(challenge.group);
+}
 
 type RouteRow = {
   id: string;
@@ -76,6 +93,56 @@ type LoginSlideRow = {
   enabled: boolean;
 };
 
+type AdminProfileRow = {
+  id: string;
+  name: string | null;
+  email?: string | null;
+  avatar_url?: string | null;
+  created_at: string;
+};
+
+type AdminChallengeMemberRow = {
+  challenge_id: string;
+  challenge_group?: Challenge['group'] | null;
+  joined_at: string;
+  challenges: { title: string; org: string; goal_km: number | string; challenge_group?: Challenge['group'] | null } | { title: string; org: string; goal_km: number | string; challenge_group?: Challenge['group'] | null }[] | null;
+};
+
+type AdminRunRow = {
+  id: string;
+  route_id: string | null;
+  challenge_id: string | null;
+  distance_km: number | string;
+  duration_seconds: number;
+  calories: number;
+  pace_seconds_per_km: number | null;
+  started_at: string;
+  completed_at: string;
+  routes?: { title: string; area: string } | { title: string; area: string }[] | null;
+  challenges?: { title: string; org: string } | { title: string; org: string }[] | null;
+};
+
+type AdminClubEventMemberRow = {
+  event_id: string;
+  joined_at: string;
+  status: string;
+  club_events: { title: string; location: string; starts_at: string; running_clubs?: { name: string } | { name: string }[] | null } | { title: string; location: string; starts_at: string; running_clubs?: { name: string } | { name: string }[] | null }[] | null;
+};
+
+type AdminCompetitionMemberRow = {
+  user_id: string;
+  joined_at: string;
+  profiles: { name: string | null; email?: string | null } | { name: string | null; email?: string | null }[] | null;
+};
+
+type AdminCompetitionRunRow = {
+  user_id: string;
+  distance_km: number | string;
+  duration_seconds: number;
+  pace_seconds_per_km: number | null;
+  completed_at: string;
+};
+
 export type RunInput = {
   userId: string;
   routeId: string | null;
@@ -85,6 +152,7 @@ export type RunInput = {
   calories: number;
   coordinates: Point[];
   startedAt: string;
+  completedAt?: string;
 };
 
 export type ProfilePerson = {
@@ -98,7 +166,23 @@ export type ProfileDashboardData = {
   totalKm: number;
   totalRuns: number;
   totalSeconds: number;
-  weekly: { date: string; label: string; distanceKm: number }[];
+  previousWeekKm: number;
+  weekly: {
+    date: string;
+    label: string;
+    distanceKm: number;
+    runs: {
+      id: string;
+      routeId: string | null;
+      distanceKm: number;
+      durationSeconds: number;
+      calories: number;
+      paceSecondsPerKm: number | null;
+      coordinates: Point[];
+      startedAt: string;
+      completedAt: string;
+    }[];
+  }[];
   following: ProfilePerson[];
   followers: ProfilePerson[];
   challengeProgress: { challengeId: string; totalKm: number; rank: number; participantCount: number }[];
@@ -127,6 +211,68 @@ export type ConversationPreview = {
   unread: number;
 };
 
+export type AdminRegisteredUser = {
+  id: string;
+  name: string;
+  email: string;
+  avatarUrl?: string;
+  joined: string;
+  totalKm: number;
+  runs: number;
+  status: 'active' | 'blocked';
+};
+
+export type AdminUserChallenge = {
+  challengeId: string;
+  title: string;
+  org: string;
+  group: Challenge['group'];
+  goalKm: number;
+  joinedAt: string;
+};
+
+export type AdminUserRun = {
+  id: string;
+  routeTitle: string;
+  challengeTitle?: string;
+  distanceKm: number;
+  durationSeconds: number;
+  calories: number;
+  paceSecondsPerKm?: number;
+  startedAt: string;
+  completedAt: string;
+};
+
+export type AdminUserEventHistory = {
+  eventId: string;
+  title: string;
+  clubName: string;
+  location: string;
+  startsAt: string;
+  joinedAt: string;
+  status: string;
+};
+
+export type AdminRegisteredUserDetail = AdminRegisteredUser & {
+  challenges: AdminUserChallenge[];
+  eventHistory: AdminUserEventHistory[];
+  runHistory: AdminUserRun[];
+};
+
+export type AdminCompetitionPerformance = {
+  userId: string;
+  name: string;
+  email: string;
+  rank: number;
+  distanceKm: number;
+  durationSeconds: number;
+  paceSecondsPerKm: number;
+  progress: number;
+  runCount: number;
+  finished: boolean;
+  lastRunAt: string;
+};
+
 type RunningClubRow = {
   id: string;
   name: string;
@@ -138,6 +284,7 @@ type RunningClubRow = {
   total_km: number | string;
   rank: number;
   meeting_info: string;
+  social_links?: RunningClub['socialLinks'] | null;
 };
 
 type ClubMediaRow = {
@@ -192,7 +339,22 @@ function profileAvatar(profile: ProfileRelation) {
   return profile?.avatar_url ?? undefined;
 }
 
+function relationOne<T>(value: T | T[] | null | undefined): T | null {
+  if (Array.isArray(value)) return value[0] ?? null;
+  return value ?? null;
+}
+
+function formatAdminDate(value: string) {
+  return new Date(value).toLocaleDateString('mn-MN', { year: 'numeric', month: '2-digit', day: '2-digit' });
+}
+
 function fileExtension(uri: string, type: MediaItem['type']) {
+  const dataMime = uri.match(/^data:([^;,]+)/)?.[1];
+  if (dataMime === 'image/svg+xml') return 'svg';
+  if (dataMime === 'image/png') return 'png';
+  if (dataMime === 'image/webp') return 'webp';
+  if (dataMime === 'image/jpeg') return 'jpg';
+  if (dataMime === 'video/mp4') return 'mp4';
   const cleanUri = uri.split('?')[0];
   const match = cleanUri.match(/\.([a-zA-Z0-9]+)$/);
   if (match) return match[1].toLowerCase();
@@ -202,37 +364,103 @@ function fileExtension(uri: string, type: MediaItem['type']) {
 function contentType(extension: string, type: MediaItem['type']) {
   const types: Record<string, string> = {
     gif: 'image/gif', jpeg: 'image/jpeg', jpg: 'image/jpeg', mov: 'video/quicktime',
-    mp4: 'video/mp4', png: 'image/png', webm: 'video/webm', webp: 'image/webp'
+    mp4: 'video/mp4', png: 'image/png', svg: 'image/svg+xml', webm: 'video/webm', webp: 'image/webp'
   };
   return types[extension] ?? (type === 'video' ? 'video/mp4' : 'image/jpeg');
 }
 
+const base64Lookup = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+function base64ToArrayBuffer(value: string) {
+  const clean = value.replace(/\s/g, '').replace(/-/g, '+').replace(/_/g, '/');
+  const padding = clean.endsWith('==') ? 2 : clean.endsWith('=') ? 1 : 0;
+  const outputLength = Math.floor((clean.length * 3) / 4) - padding;
+  const bytes = new Uint8Array(Math.max(0, outputLength));
+  let buffer = 0;
+  let bits = 0;
+  let outputIndex = 0;
+
+  for (const char of clean) {
+    if (char === '=') break;
+    const valueIndex = base64Lookup.indexOf(char);
+    if (valueIndex < 0) continue;
+    buffer = (buffer << 6) | valueIndex;
+    bits += 6;
+    if (bits >= 8 && outputIndex < bytes.length) {
+      bits -= 8;
+      bytes[outputIndex] = (buffer >> bits) & 0xff;
+      outputIndex += 1;
+    }
+  }
+
+  return bytes.buffer;
+}
+
 async function uriToArrayBuffer(uri: string) {
+  const dataMatch = uri.match(/^data:([^;,]+)?(;base64)?,(.*)$/);
+  if (dataMatch) {
+    const encoded = dataMatch[3] ?? '';
+    if (dataMatch[2]) return base64ToArrayBuffer(encoded);
+    const value = decodeURIComponent(encoded);
+    const bytes = new Uint8Array(value.length);
+    for (let index = 0; index < value.length; index += 1) bytes[index] = value.charCodeAt(index);
+    return bytes.buffer;
+  }
+
+  if (/^(file|content|asset-library):/.test(uri)) {
+    try {
+      const base64 = await FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 });
+      return base64ToArrayBuffer(base64);
+    } catch (error) {
+      throw new Error(`local media read: ${error instanceof Error ? error.message : 'файлыг уншиж чадсангүй'}`);
+    }
+  }
+
   const response = await fetch(uri);
   if (!response.ok) throw new Error('Медиа файлыг уншиж чадсангүй.');
   return response.arrayBuffer();
 }
 
 export async function fetchChallenges(): Promise<Challenge[]> {
-  const { data, error } = await supabase
+  const withMode = await supabase
     .from('challenges')
-    .select('id,title,org,type,challenge_group,goal_km,reward,color,image_url,registration_ends_at')
+    .select('id,title,org,type,challenge_group,completion_mode,goal_km,reward,color,image_url,description,registration_info,organizer_info,reward_info,registration_ends_at')
     .eq('enabled', true)
     .order('registration_ends_at');
+  const withoutMode = withMode.error?.message.includes('completion_mode')
+    ? await supabase
+      .from('challenges')
+      .select('id,title,org,type,challenge_group,goal_km,reward,color,image_url,description,registration_info,organizer_info,reward_info,registration_ends_at')
+      .eq('enabled', true)
+      .order('registration_ends_at')
+    : withMode;
+  const { data, error } = withoutMode;
   throwIfError(error);
 
-  return ((data ?? []) as ChallengeRow[]).map(row => ({
+  const remoteChallenges = ((data ?? []) as ChallengeRow[]).map(row => ({
     id: row.id,
     title: row.title,
     org: row.org,
     type: row.type,
     group: row.challenge_group,
+    completionMode: row.completion_mode ?? defaultChallengeCompletionMode(row.challenge_group),
     goalKm: Number(row.goal_km),
     reward: row.reward ?? undefined,
     color: row.color,
     image: row.image_url,
+    description: row.description ?? undefined,
+    registrationInfo: row.registration_info ?? undefined,
+    organizerInfo: row.organizer_info ?? undefined,
+    rewardInfo: row.reward_info ?? undefined,
     registrationEndsInSeconds: Math.max(0, Math.floor((new Date(row.registration_ends_at).getTime() - Date.now()) / 1000))
   }));
+  const adminChallenges = getAdminChallenges();
+  const remoteIds = new Set(remoteChallenges.map(challenge => challenge.id));
+  return [
+    ...adminChallenges.filter(challenge => !remoteIds.has(challenge.id)),
+    ...getAdminMarathonChallenges().filter(challenge => !remoteIds.has(challenge.id)),
+    ...remoteChallenges
+  ];
 }
 
 export async function fetchRoutes(): Promise<RouteOption[]> {
@@ -261,41 +489,88 @@ export async function fetchRoutes(): Promise<RouteOption[]> {
   }));
 }
 
+export async function saveAdminRoute(route: RouteOption): Promise<RouteOption> {
+  const { error } = await supabase.from('routes').upsert({
+    id: route.id,
+    title: route.title,
+    city: route.city,
+    area: route.area,
+    distance_km: route.distanceKm,
+    live_runners: route.liveRunners,
+    elevation_m: route.elevationM,
+    avg_pace: route.avgPace,
+    difficulty: route.difficulty,
+    estimated_duration: route.estimatedDuration,
+    recent_activities: route.recentActivities,
+    image_url: route.image,
+    center: route.center,
+    coordinates: route.coordinates,
+    enabled: true,
+    updated_at: new Date().toISOString()
+  });
+  throwIfError(error);
+  return route;
+}
+
+export async function deleteAdminRoute(routeId: string): Promise<void> {
+  const { error } = await supabase
+    .from('routes')
+    .update({ enabled: false, updated_at: new Date().toISOString() })
+    .eq('id', routeId);
+  throwIfError(error);
+}
+
 export async function fetchRunningClubs(userId?: string): Promise<RunningClub[]> {
-  const [clubsResult, membershipsResult, mediaResult] = await Promise.all([
-    supabase
-      .from('running_clubs')
-      .select('id,name,city,description,image_url,member_count,weekly_km,total_km,rank,meeting_info')
-      .eq('enabled', true)
-      .order('rank')
-      .limit(10),
+  const clubsQuery = () => supabase
+    .from('running_clubs')
+    .select('id,name,city,description,image_url,member_count,weekly_km,total_km,rank,meeting_info,social_links')
+    .eq('enabled', true)
+    .order('rank')
+    .limit(10);
+  const fallbackClubsQuery = () => supabase
+    .from('running_clubs')
+    .select('id,name,city,description,image_url,member_count,weekly_km,total_km,rank,meeting_info')
+    .eq('enabled', true)
+    .order('rank')
+    .limit(10);
+  const [initialClubsResult, membershipsResult, mediaResult] = await Promise.all([
+    clubsQuery(),
     userId
       ? supabase.from('club_members').select('club_id').eq('user_id', userId)
       : Promise.resolve({ data: [], error: null }),
     supabase.from('club_media').select('club_id,public_url,sort_order').order('sort_order')
   ]);
+  const clubsResult = initialClubsResult.error?.message.includes('social_links')
+    ? await fallbackClubsQuery()
+    : initialClubsResult;
   throwIfError(clubsResult.error);
   throwIfError(membershipsResult.error);
   const joinedIds = new Set((membershipsResult.data ?? []).map(item => item.club_id as string));
   const mediaRows = mediaResult.error ? [] : (mediaResult.data ?? []) as ClubMediaRow[];
+  const localOverrides = getLocalClubContentOverrides();
 
-  return ((clubsResult.data ?? []) as RunningClubRow[]).map(club => ({
-    id: club.id,
-    name: club.name,
-    city: club.city,
-    description: club.description,
-    image: club.image_url,
-    memberCount: club.member_count,
-    weeklyKm: Number(club.weekly_km),
-    totalKm: Number(club.total_km ?? 0),
-    rank: club.rank,
-    meetingInfo: club.meeting_info,
-    galleryImages: (() => {
-      const gallery = mediaRows.filter(item => item.club_id === club.id).map(item => item.public_url);
-      return gallery.length ? gallery : [club.image_url];
-    })(),
-    joined: joinedIds.has(club.id)
-  }));
+  return ((clubsResult.data ?? []) as RunningClubRow[]).map(club => {
+    const local = localOverrides.find(item => item.clubId === club.id);
+    const image = local?.imageUrl ?? club.image_url;
+    const gallery = local?.galleryImages?.length
+      ? local.galleryImages
+      : mediaRows.filter(item => item.club_id === club.id).map(item => item.public_url);
+    return {
+      id: club.id,
+      name: club.name,
+      city: club.city,
+      description: club.description,
+      image,
+      memberCount: club.member_count,
+      weeklyKm: Number(club.weekly_km),
+      totalKm: Number(club.total_km ?? 0),
+      rank: club.rank,
+      meetingInfo: club.meeting_info,
+      socialLinks: local?.socialLinks ?? club.social_links ?? undefined,
+      galleryImages: gallery.length ? gallery : [image],
+      joined: joinedIds.has(club.id)
+    };
+  });
 }
 
 function imageDataExtension(uri: string) {
@@ -338,6 +613,7 @@ export async function saveRunningClubs(clubs: RunningClub[]): Promise<RunningClu
     total_km: club.totalKm,
     rank: club.rank,
     meeting_info: club.meetingInfo,
+    social_links: club.socialLinks ?? {},
     enabled: true
   })));
   throwIfError(clubError);
@@ -366,7 +642,7 @@ export async function fetchClubEvents(): Promise<ClubEvent[]> {
     .order('starts_at');
   throwIfError(error);
 
-  return ((data ?? []) as unknown as ClubEventRow[]).map(event => ({
+  const remoteEvents = ((data ?? []) as unknown as ClubEventRow[]).map(event => ({
     id: event.id,
     clubId: event.club_id,
     clubName: Array.isArray(event.running_clubs) ? event.running_clubs[0]?.name ?? 'Гүйлтийн клуб' : event.running_clubs?.name ?? 'Гүйлтийн клуб',
@@ -379,6 +655,22 @@ export async function fetchClubEvents(): Promise<ClubEvent[]> {
     advice: event.advice ?? [],
     participantCount: event.participant_count
   }));
+  const deletedEventIds = new Set(getLocalDeletedClubEventIds());
+  const localEvents = getLocalClubEvents().filter(event => !deletedEventIds.has(event.id)).map(event => ({
+    id: event.id,
+    clubId: event.clubId,
+    clubName: event.clubName,
+    title: event.title,
+    location: event.location,
+    startsAt: event.startsAt,
+    distanceKm: event.distanceKm ?? undefined,
+    image: event.imageUrl,
+    description: event.description,
+    advice: event.advice,
+    participantCount: event.participantCount
+  }));
+  const remoteIds = new Set(remoteEvents.map(event => event.id));
+  return [...localEvents.filter(event => !remoteIds.has(event.id)), ...remoteEvents.filter(event => !deletedEventIds.has(event.id))];
 }
 
 export async function fetchJoinedClubEventIds(userId: string): Promise<string[]> {
@@ -520,7 +812,7 @@ export async function createPost(input: {
     .insert({ user_id: input.userId, title: input.title, description: input.description })
     .select('id')
     .single();
-  throwIfError(postError);
+  if (postError) throw new Error(`posts insert: ${postError.message}`);
   if (!post) throw new Error('Нийтлэлийн мөр үүссэнгүй.');
 
   const uploadedPaths: string[] = [];
@@ -532,7 +824,7 @@ export async function createPost(input: {
       const { error: uploadError } = await supabase.storage
         .from('post-media')
         .upload(path, bytes, { contentType: contentType(extension, item.type), upsert: false });
-      throwIfError(uploadError);
+      if (uploadError) throw new Error(`post-media upload: ${uploadError.message}`);
       uploadedPaths.push(path);
 
       const publicUrl = supabase.storage.from('post-media').getPublicUrl(path).data.publicUrl;
@@ -543,7 +835,7 @@ export async function createPost(input: {
         public_url: publicUrl,
         sort_order: index
       });
-      throwIfError(mediaError);
+      if (mediaError) throw new Error(`post_media insert: ${mediaError.message}`);
     }
   } catch (error) {
     if (uploadedPaths.length) await supabase.storage.from('post-media').remove(uploadedPaths);
@@ -561,18 +853,322 @@ export async function fetchJoinedChallengeIds(userId: string): Promise<string[]>
   return (data ?? []).map(item => item.challenge_id as string);
 }
 
-export async function joinChallenge(_userId: string, challenge: Challenge) {
-  const { error } = await supabase.rpc('set_my_active_challenge', {
-    target_challenge_id: challenge.id
-  });
+export async function ensureUserProfile(userId: string, name: string, email: string): Promise<void> {
+  const normalizedName = name.trim() || 'Гүйгч';
+  const normalizedEmail = email.trim().toLowerCase();
+  const { error } = await supabase
+    .from('profiles')
+    .upsert({ id: userId, name: normalizedName, email: normalizedEmail, updated_at: new Date().toISOString() }, { onConflict: 'id' });
+  if (!error) return;
+  if (error.message.includes('email')) {
+    const { error: fallbackError } = await supabase
+      .from('profiles')
+      .upsert({ id: userId, name: normalizedName, updated_at: new Date().toISOString() }, { onConflict: 'id' });
+    throwIfError(fallbackError);
+    return;
+  }
   throwIfError(error);
 }
 
-export async function leaveChallenge(_userId: string, challengeId: string) {
+export async function updateProfileAvatar(userId: string, avatarUrl: string): Promise<void> {
+  const { error } = await supabase
+    .from('profiles')
+    .update({ avatar_url: avatarUrl, updated_at: new Date().toISOString() })
+    .eq('id', userId);
+  throwIfError(error);
+}
+
+export async function joinChallenge(userId: string, challenge: Challenge) {
+  const registrationEndsAt = new Date(Date.now() + challenge.registrationEndsInSeconds * 1000).toISOString();
+  const completionMode = challengeCompletionMode(challenge);
+  const v2Result = await supabase.rpc('register_challenge_with_snapshot_v2', {
+    target_challenge_id: challenge.id,
+    target_title: challenge.title,
+    target_org: challenge.org,
+    target_type: challenge.type,
+    target_group: challenge.group,
+    target_completion_mode: completionMode,
+    target_goal_km: challenge.goalKm,
+    target_reward: challenge.reward ?? null,
+    target_color: challenge.color,
+    target_image_url: challenge.image,
+    target_registration_ends_at: registrationEndsAt
+  });
+  if (!v2Result.error) return;
+
+  const { error } = await supabase.rpc('register_challenge_with_snapshot', {
+    target_challenge_id: challenge.id,
+    target_title: challenge.title,
+    target_org: challenge.org,
+    target_type: challenge.type,
+    target_group: challenge.group,
+    target_goal_km: challenge.goalKm,
+    target_reward: challenge.reward ?? null,
+    target_color: challenge.color,
+    target_image_url: challenge.image,
+    target_registration_ends_at: registrationEndsAt
+  });
+  if (!error) return;
+  const { error: fallbackError } = await supabase.rpc('set_my_active_challenge', {
+    target_challenge_id: challenge.id
+  });
+  if (!fallbackError) return;
+
+  const snapshotWithMode = await supabase
+    .from('challenges')
+    .upsert({
+      id: challenge.id,
+      title: challenge.title,
+      org: challenge.org,
+      type: challenge.type,
+      challenge_group: challenge.group,
+      completion_mode: completionMode,
+      goal_km: challenge.goalKm,
+      reward: challenge.reward ?? null,
+      color: challenge.color,
+      image_url: challenge.image,
+      registration_ends_at: registrationEndsAt,
+      enabled: true
+    });
+  const snapshotError = snapshotWithMode.error?.message.includes('completion_mode')
+    ? (await supabase
+      .from('challenges')
+      .upsert({
+        id: challenge.id,
+        title: challenge.title,
+        org: challenge.org,
+        type: challenge.type,
+        challenge_group: challenge.group,
+        goal_km: challenge.goalKm,
+        reward: challenge.reward ?? null,
+        color: challenge.color,
+        image_url: challenge.image,
+        registration_ends_at: registrationEndsAt,
+        enabled: true
+      })).error
+    : snapshotWithMode.error;
+  throwIfError(snapshotError);
+
+  const { error: deleteError } = await supabase
+    .from('challenge_members')
+    .delete()
+    .eq('user_id', userId)
+    .eq('challenge_group', challenge.group);
+  throwIfError(deleteError);
+
+  const { error: insertError } = await supabase
+    .from('challenge_members')
+    .insert({ challenge_id: challenge.id, user_id: userId, challenge_group: challenge.group });
+  throwIfError(insertError);
+}
+
+export async function fetchAdminRegisteredUsers(): Promise<AdminRegisteredUser[]> {
+  const profileQuery = () => supabase.from('profiles').select('id,name,email,avatar_url,created_at').order('created_at', { ascending: false });
+  const fallbackProfileQuery = () => supabase.from('profiles').select('id,name,avatar_url,created_at').order('created_at', { ascending: false });
+  const profileResult = await profileQuery();
+  const profilesResult = profileResult.error?.message.includes('email') ? await fallbackProfileQuery() : profileResult;
+  throwIfError(profilesResult.error);
+
+  const profiles = (profilesResult.data ?? []) as AdminProfileRow[];
+  if (!profiles.length) return [];
+  const ids = profiles.map(profile => profile.id);
+  const { data: runRows, error: runError } = await supabase
+    .from('runs')
+    .select('user_id,distance_km')
+    .in('user_id', ids);
+  throwIfError(runError);
+
+  const stats = new Map<string, { totalKm: number; runs: number }>();
+  for (const row of runRows ?? []) {
+    const userId = row.user_id as string;
+    const current = stats.get(userId) ?? { totalKm: 0, runs: 0 };
+    current.totalKm += Number(row.distance_km ?? 0);
+    current.runs += 1;
+    stats.set(userId, current);
+  }
+
+  return profiles.map(profile => {
+    const stat = stats.get(profile.id) ?? { totalKm: 0, runs: 0 };
+    return {
+      id: profile.id,
+      name: profile.name || 'Гүйгч',
+      email: profile.email || 'Имэйл бүртгэгдээгүй',
+      avatarUrl: profile.avatar_url ?? undefined,
+      joined: formatAdminDate(profile.created_at),
+      totalKm: Number(stat.totalKm.toFixed(1)),
+      runs: stat.runs,
+      status: 'active'
+    };
+  });
+}
+
+export async function fetchAdminRegisteredUserDetail(userId: string): Promise<AdminRegisteredUserDetail> {
+  const profileQuery = () => supabase.from('profiles').select('id,name,email,avatar_url,created_at').eq('id', userId).single();
+  const fallbackProfileQuery = () => supabase.from('profiles').select('id,name,avatar_url,created_at').eq('id', userId).single();
+  const initialProfileResult = await profileQuery();
+  const profileResult = initialProfileResult.error?.message.includes('email') ? await fallbackProfileQuery() : initialProfileResult;
+  throwIfError(profileResult.error);
+  if (!profileResult.data) throw new Error('Хэрэглэгч олдсонгүй.');
+
+  const [challengeResult, runResult, eventResult] = await Promise.all([
+    supabase
+      .from('challenge_members')
+      .select('challenge_id,challenge_group,joined_at,challenges(title,org,goal_km,challenge_group)')
+      .eq('user_id', userId)
+      .order('joined_at', { ascending: false }),
+    supabase
+      .from('runs')
+      .select('id,route_id,challenge_id,distance_km,duration_seconds,calories,pace_seconds_per_km,started_at,completed_at,routes(title,area),challenges(title,org)')
+      .eq('user_id', userId)
+      .order('completed_at', { ascending: false }),
+    supabase
+      .from('club_event_members')
+      .select('event_id,joined_at,status,club_events(title,location,starts_at,running_clubs(name))')
+      .eq('user_id', userId)
+      .order('joined_at', { ascending: false })
+  ]);
+  throwIfError(challengeResult.error);
+  throwIfError(runResult.error);
+  throwIfError(eventResult.error);
+
+  const profile = profileResult.data as AdminProfileRow;
+  const runHistory = ((runResult.data ?? []) as unknown as AdminRunRow[]).map(run => {
+    const route = relationOne(run.routes);
+    const challenge = relationOne(run.challenges);
+    return {
+      id: run.id,
+      routeTitle: route?.title ?? run.route_id ?? 'Маршрутгүй гүйлт',
+      challengeTitle: challenge?.title,
+      distanceKm: Number(run.distance_km),
+      durationSeconds: Number(run.duration_seconds),
+      calories: Number(run.calories),
+      paceSecondsPerKm: run.pace_seconds_per_km ?? undefined,
+      startedAt: run.started_at,
+      completedAt: run.completed_at
+    };
+  });
+  const totalKm = runHistory.reduce((sum, run) => sum + run.distanceKm, 0);
+
+  return {
+    id: profile.id,
+    name: profile.name || 'Гүйгч',
+    email: profile.email || 'Имэйл бүртгэгдээгүй',
+    avatarUrl: profile.avatar_url ?? undefined,
+    joined: formatAdminDate(profile.created_at),
+    totalKm: Number(totalKm.toFixed(1)),
+    runs: runHistory.length,
+    status: 'active',
+    challenges: ((challengeResult.data ?? []) as unknown as AdminChallengeMemberRow[]).map(member => {
+      const challenge = relationOne(member.challenges);
+      return {
+        challengeId: member.challenge_id,
+        title: challenge?.title ?? member.challenge_id,
+        org: challenge?.org ?? 'RunBoost',
+        group: member.challenge_group ?? challenge?.challenge_group ?? '5k',
+        goalKm: Number(challenge?.goal_km ?? 0),
+        joinedAt: member.joined_at
+      };
+    }),
+    eventHistory: ((eventResult.data ?? []) as unknown as AdminClubEventMemberRow[]).map(member => {
+      const event = relationOne(member.club_events);
+      const club = relationOne(event?.running_clubs);
+      return {
+        eventId: member.event_id,
+        title: event?.title ?? member.event_id,
+        clubName: club?.name ?? 'Клуб',
+        location: event?.location ?? '',
+        startsAt: event?.starts_at ?? member.joined_at,
+        joinedAt: member.joined_at,
+        status: member.status
+      };
+    }),
+    runHistory
+  };
+}
+
+export async function fetchAdminCompetitionPerformance(competitionId: string, goalKm: number): Promise<AdminCompetitionPerformance[]> {
+  const [memberResult, runResult] = await Promise.all([
+    supabase
+      .from('challenge_members')
+      .select('user_id,joined_at,profiles(name,email)')
+      .eq('challenge_id', competitionId),
+    supabase
+      .from('runs')
+      .select('user_id,distance_km,duration_seconds,pace_seconds_per_km,completed_at')
+      .eq('challenge_id', competitionId)
+      .order('completed_at', { ascending: false })
+  ]);
+  throwIfError(memberResult.error);
+  throwIfError(runResult.error);
+
+  const rows = new Map<string, AdminCompetitionPerformance>();
+  for (const member of (memberResult.data ?? []) as unknown as AdminCompetitionMemberRow[]) {
+    const profile = relationOne(member.profiles);
+    rows.set(member.user_id, {
+      userId: member.user_id,
+      name: profile?.name ?? 'Гүйгч',
+      email: profile?.email ?? '',
+      rank: 0,
+      distanceKm: 0,
+      durationSeconds: 0,
+      paceSecondsPerKm: 0,
+      progress: 0,
+      runCount: 0,
+      finished: false,
+      lastRunAt: member.joined_at
+    });
+  }
+
+  for (const run of (runResult.data ?? []) as unknown as AdminCompetitionRunRow[]) {
+    const current = rows.get(run.user_id) ?? {
+      userId: run.user_id,
+      name: 'Гүйгч',
+      email: '',
+      rank: 0,
+      distanceKm: 0,
+      durationSeconds: 0,
+      paceSecondsPerKm: 0,
+      progress: 0,
+      runCount: 0,
+      finished: false,
+      lastRunAt: run.completed_at
+    };
+    current.distanceKm += Number(run.distance_km);
+    current.durationSeconds += run.duration_seconds;
+    current.runCount += 1;
+    current.lastRunAt = new Date(run.completed_at).getTime() > new Date(current.lastRunAt).getTime()
+      ? run.completed_at
+      : current.lastRunAt;
+    rows.set(run.user_id, current);
+  }
+
+  return Array.from(rows.values())
+    .map(row => ({
+      ...row,
+      distanceKm: Number(row.distanceKm.toFixed(2)),
+      paceSecondsPerKm: row.distanceKm > 0 ? Math.round(row.durationSeconds / row.distanceKm) : 0,
+      progress: Math.min(100, Math.round((row.distanceKm / goalKm) * 100)),
+      finished: row.distanceKm >= goalKm
+    }))
+    .sort((first, second) => {
+      if (first.finished !== second.finished) return first.finished ? -1 : 1;
+      if (second.distanceKm !== first.distanceKm) return second.distanceKm - first.distanceKm;
+      return first.durationSeconds - second.durationSeconds;
+    })
+    .map((row, index) => ({ ...row, rank: index + 1 }));
+}
+
+export async function leaveChallenge(userId: string, challengeId: string) {
   const { error } = await supabase.rpc('leave_my_challenge', {
     target_challenge_id: challengeId
   });
-  throwIfError(error);
+  if (!error) return;
+  const { error: fallbackError } = await supabase
+    .from('challenge_members')
+    .delete()
+    .eq('user_id', userId)
+    .eq('challenge_id', challengeId);
+  throwIfError(fallbackError ?? error);
 }
 
 export async function saveRun(input: RunInput): Promise<void> {
@@ -587,7 +1183,7 @@ export async function saveRun(input: RunInput): Promise<void> {
     pace_seconds_per_km: pace,
     coordinates: input.coordinates,
     started_at: input.startedAt,
-    completed_at: new Date().toISOString()
+    completed_at: input.completedAt ?? new Date().toISOString()
   });
   throwIfError(error);
 }
@@ -596,6 +1192,8 @@ export async function updateActiveRun(input: {
   userId: string;
   routeId: string | null;
   routeTitle: string;
+  clubId?: string | null;
+  eventId?: string | null;
   distanceKm: number;
   durationSeconds: number;
   latitude: number | null;
@@ -606,6 +1204,8 @@ export async function updateActiveRun(input: {
   const pace = input.distanceKm > 0 ? Math.round(input.durationSeconds / input.distanceKm) : null;
   const { error } = await supabase.from('active_runs').upsert({
     user_id: input.userId,
+    club_id: input.clubId ?? null,
+    event_id: input.eventId ?? null,
     route_id: input.routeId,
     route_title: input.routeTitle,
     distance_km: input.distanceKm,
@@ -638,7 +1238,7 @@ async function fetchProfilesByIds(ids: string[]) {
 export async function fetchProfileDashboard(userId: string): Promise<ProfileDashboardData> {
   const [profileResult, runsResult, followingResult, followersResult, progressResult] = await Promise.all([
     supabase.from('profiles').select('id,name,avatar_url').eq('id', userId).single(),
-    supabase.from('runs').select('distance_km,duration_seconds,completed_at').eq('user_id', userId).order('completed_at'),
+    supabase.from('runs').select('id,route_id,distance_km,duration_seconds,calories,pace_seconds_per_km,coordinates,started_at,completed_at').eq('user_id', userId).order('completed_at'),
     supabase.from('follows').select('following_id').eq('follower_id', userId),
     supabase.from('follows').select('follower_id').eq('following_id', userId),
     supabase.rpc('get_my_challenge_progress')
@@ -647,7 +1247,6 @@ export async function fetchProfileDashboard(userId: string): Promise<ProfileDash
   throwIfError(runsResult.error);
   throwIfError(followingResult.error);
   throwIfError(followersResult.error);
-  throwIfError(progressResult.error);
   if (!profileResult.data) throw new Error('Профайл олдсонгүй.');
 
   const followingIds = (followingResult.data ?? []).map(item => item.following_id as string);
@@ -655,8 +1254,14 @@ export async function fetchProfileDashboard(userId: string): Promise<ProfileDash
   const people = await fetchProfilesByIds([...new Set([...followingIds, ...followerIds])]);
   const peopleById = new Map(people.map(person => [person.id, person]));
   const runs = (runsResult.data ?? []).map(run => ({
+    id: String(run.id),
+    routeId: run.route_id ? String(run.route_id) : null,
     distanceKm: Number(run.distance_km),
     durationSeconds: Number(run.duration_seconds),
+    calories: Number(run.calories ?? 0),
+    paceSecondsPerKm: run.pace_seconds_per_km === null ? null : Number(run.pace_seconds_per_km),
+    coordinates: Array.isArray(run.coordinates) ? run.coordinates as Point[] : [],
+    startedAt: String(run.started_at ?? run.completed_at),
     completedAt: String(run.completed_at)
   }));
   const today = new Date();
@@ -667,29 +1272,39 @@ export async function fetchProfileDashboard(userId: string): Promise<ProfileDash
     date.setDate(today.getDate() - (6 - index));
     const nextDate = new Date(date);
     nextDate.setDate(date.getDate() + 1);
-    const distanceKm = runs
-      .filter(run => {
+    const dayRuns = runs.filter(run => {
         const completedAt = new Date(run.completedAt);
         return completedAt >= date && completedAt < nextDate;
-      })
-      .reduce((sum, run) => sum + run.distanceKm, 0);
-    return { date: date.toISOString(), label: dayLabels[date.getDay()], distanceKm };
+      });
+    const distanceKm = dayRuns.reduce((sum, run) => sum + run.distanceKm, 0);
+    return { date: date.toISOString(), label: dayLabels[date.getDay()], distanceKm, runs: dayRuns };
   });
+  const previousWeekStart = new Date(today);
+  previousWeekStart.setDate(today.getDate() - 7);
+  const previousWeekKm = runs
+    .filter(run => {
+      const completedAt = new Date(run.completedAt);
+      return completedAt >= previousWeekStart && completedAt < today;
+    })
+    .reduce((sum, run) => sum + run.distanceKm, 0);
+
+  const challengeProgress = progressResult.error ? [] : ((progressResult.data ?? []) as { challenge_id: string; total_km: number | string; rank: number; participant_count: number }[]).map(item => ({
+    challengeId: item.challenge_id,
+    totalKm: Number(item.total_km),
+    rank: Number(item.rank),
+    participantCount: Number(item.participant_count)
+  }));
 
   return {
     profile: mapProfile(profileResult.data),
     totalKm: runs.reduce((sum, run) => sum + run.distanceKm, 0),
     totalRuns: runs.length,
     totalSeconds: runs.reduce((sum, run) => sum + run.durationSeconds, 0),
+    previousWeekKm,
     weekly,
     following: followingIds.map(id => peopleById.get(id)).filter((person): person is ProfilePerson => Boolean(person)),
     followers: followerIds.map(id => peopleById.get(id)).filter((person): person is ProfilePerson => Boolean(person)),
-    challengeProgress: ((progressResult.data ?? []) as { challenge_id: string; total_km: number | string; rank: number; participant_count: number }[]).map(item => ({
-      challengeId: item.challenge_id,
-      totalKm: Number(item.total_km),
-      rank: Number(item.rank),
-      participantCount: Number(item.participant_count)
-    }))
+    challengeProgress
   };
 }
 

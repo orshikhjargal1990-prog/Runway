@@ -9,6 +9,11 @@ export type RunningClub = {
   totalKm: number;
   rank: number;
   meetingInfo: string;
+  socialLinks?: {
+    facebook?: string;
+    instagram?: string;
+    website?: string;
+  };
   galleryImages: string[];
   joined?: boolean;
 };

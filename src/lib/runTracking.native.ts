@@ -10,7 +10,13 @@ import { supabase } from './supabase';
 const TASK_NAME = 'runboost-active-run-location';
 const STORAGE_KEY = 'runboost-active-run';
 const NOTIFICATION_ID = 'runboost-active-run';
-const CHANNEL_ID = 'active-run';
+const CHANNEL_ID = 'active-run-silent';
+const NOTIFICATION_UPDATE_INTERVAL_MS = 30000;
+const MAX_ACCEPTED_ACCURACY_METERS = 50;
+const MAX_FIRST_POINT_ACCURACY_METERS = 100;
+const MIN_SEGMENT_DISTANCE_METERS = 2;
+const MAX_RUNNING_SPEED_METERS_PER_SECOND = 4;
+const MAX_RUNNING_SEGMENT_SPEED_METERS_PER_SECOND = 4.8;
 
 function radians(value: number) {
   return (value * Math.PI) / 180;
@@ -32,6 +38,48 @@ function routeDistance(coordinates: Point[]) {
   ), 0);
 }
 
+function isValidPoint(point: Point) {
+  return Number.isFinite(point.latitude)
+    && Number.isFinite(point.longitude)
+    && Math.abs(point.latitude) <= 90
+    && Math.abs(point.longitude) <= 180;
+}
+
+function getFilteredCoordinates(previousCoordinates: Point[], locations: Location.LocationObject[]) {
+  let lastPoint = previousCoordinates.at(-1);
+  let lastTimestamp = Date.now();
+  const additions: Point[] = [];
+
+  for (const location of locations) {
+    const point = {
+      latitude: location.coords.latitude,
+      longitude: location.coords.longitude
+    };
+    const accuracy = location.coords.accuracy ?? Number.POSITIVE_INFINITY;
+
+    if (!isValidPoint(point)) continue;
+    if (!lastPoint && accuracy > MAX_FIRST_POINT_ACCURACY_METERS) continue;
+    if (lastPoint && accuracy > MAX_ACCEPTED_ACCURACY_METERS) continue;
+
+    if (lastPoint) {
+      const distanceMeters = segmentDistance(lastPoint, point) * 1000;
+      const elapsedSeconds = Math.max(1, ((location.timestamp || Date.now()) - lastTimestamp) / 1000);
+      const reportedSpeed = location.coords.speed ?? null;
+      const segmentSpeed = distanceMeters / elapsedSeconds;
+
+      if (distanceMeters < MIN_SEGMENT_DISTANCE_METERS) continue;
+      if (reportedSpeed !== null && reportedSpeed > MAX_RUNNING_SPEED_METERS_PER_SECOND) continue;
+      if (segmentSpeed > MAX_RUNNING_SEGMENT_SPEED_METERS_PER_SECOND) continue;
+    }
+
+    additions.push(point);
+    lastPoint = point;
+    lastTimestamp = location.timestamp || Date.now();
+  }
+
+  return [...previousCoordinates, ...additions].slice(-5000);
+}
+
 function duration(seconds: number) {
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
@@ -47,10 +95,13 @@ async function showRunNotification(snapshot: BackgroundRunSnapshot) {
       title: 'Гүйлт үргэлжилж байна',
       body: `${snapshot.distanceKm.toFixed(2)} км  ·  ${duration(seconds)}  ·  ${snapshot.routeTitle}`,
       data: { screen: 'run' },
+      sound: false,
+      vibrate: [],
+      priority: Notifications.AndroidNotificationPriority.MIN,
       sticky: true,
       autoDismiss: false
     },
-    trigger: null
+    trigger: Platform.OS === 'android' ? { channelId: CHANNEL_ID } : null
   });
 }
 
@@ -63,25 +114,29 @@ if (!TaskManager.isTaskDefined(TASK_NAME)) {
     const stored = await AsyncStorage.getItem(STORAGE_KEY);
     if (!stored) return;
     const snapshot = JSON.parse(stored) as BackgroundRunSnapshot;
-    const additions = locations.map(location => ({
-      latitude: location.coords.latitude,
-      longitude: location.coords.longitude
-    }));
-    const coordinates = [...snapshot.coordinates, ...additions].slice(-5000);
+    const coordinates = getFilteredCoordinates(snapshot.coordinates, locations);
+    if (coordinates.length === snapshot.coordinates.length) return;
+    const now = Date.now();
+    const shouldUpdateNotification = now - (snapshot.notificationUpdatedAt ?? 0) >= NOTIFICATION_UPDATE_INTERVAL_MS;
     const next = {
       ...snapshot,
       coordinates,
       distanceKm: routeDistance(coordinates),
-      updatedAt: Date.now()
+      updatedAt: now,
+      notificationUpdatedAt: shouldUpdateNotification ? now : snapshot.notificationUpdatedAt
     };
     await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-    await showRunNotification(next);
+    if (shouldUpdateNotification) {
+      await showRunNotification(next);
+    }
     const { data: auth } = await supabase.auth.getUser();
     if (auth.user) {
       const seconds = Math.max(0, Math.floor((Date.now() - next.startedAt) / 1000));
       const last = coordinates.at(-1);
       await supabase.from('active_runs').upsert({
         user_id: auth.user.id,
+        club_id: next.clubId ?? null,
+        event_id: next.eventId ?? null,
         route_id: next.routeId ?? null,
         route_title: next.routeTitle,
         distance_km: next.distanceKm,
@@ -100,6 +155,8 @@ export async function startBackgroundRunTracking(input: {
   startedAt: number;
   routeId?: string;
   routeTitle: string;
+  clubId?: string;
+  eventId?: string;
   coordinates?: Point[];
 }): Promise<boolean> {
   const backgroundPermission = await Location.requestBackgroundPermissionsAsync();
@@ -110,9 +167,9 @@ export async function startBackgroundRunTracking(input: {
 
   if (Platform.OS === 'android') {
     await Notifications.setNotificationChannelAsync(CHANNEL_ID, {
-      name: 'Идэвхтэй гүйлт',
-      importance: Notifications.AndroidImportance.LOW,
-      vibrationPattern: [0],
+      name: 'Идэвхтэй гүйлт (чимээгүй)',
+      importance: Notifications.AndroidImportance.MIN,
+      vibrationPattern: [],
       sound: null,
       lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC
     });
@@ -123,9 +180,12 @@ export async function startBackgroundRunTracking(input: {
     startedAt: input.startedAt,
     routeId: input.routeId,
     routeTitle: input.routeTitle,
+    clubId: input.clubId,
+    eventId: input.eventId,
     coordinates,
     distanceKm: routeDistance(coordinates),
-    updatedAt: Date.now()
+    updatedAt: Date.now(),
+    notificationUpdatedAt: Date.now()
   };
   await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
   await showRunNotification(snapshot);

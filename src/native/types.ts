@@ -1,7 +1,26 @@
 export type TabKey = 'home' | 'run' | 'explore' | 'profile';
 
 export type ChallengeType = 'Happy' | 'Corporate';
-export type ChallengeGroup = '5k' | '10k';
+export type ChallengeGroup = '5k' | '10k' | 'marathon';
+export type ChallengeCompletionMode = 'cumulative' | 'single_run';
+export type MarathonRegistrationCategoryId = 'regular' | 'para' | 'guide' | 'assistant';
+
+export type MarathonRegistrationOption = {
+  id: string;
+  title: string;
+  distance: string;
+  age: string;
+  tone: string;
+  note: string;
+  enabled?: boolean;
+};
+
+export type MarathonRegistrationCategory = {
+  id: MarathonRegistrationCategoryId;
+  title: string;
+  enabled: boolean;
+  options: MarathonRegistrationOption[];
+};
 
 export type Challenge = {
   id: string;
@@ -9,10 +28,17 @@ export type Challenge = {
   org: string;
   type: ChallengeType;
   group: ChallengeGroup;
+  completionMode?: ChallengeCompletionMode;
   goalKm: number;
   reward?: string;
   color: string;
   image: string;
+  galleryImages?: string[];
+  description?: string;
+  registrationInfo?: string;
+  organizerInfo?: string;
+  rewardInfo?: string;
+  marathonRegistrationCategories?: MarathonRegistrationCategory[];
   registrationEndsInSeconds: number;
 };
 

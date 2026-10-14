@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Animated, ImageBackground, Modal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Alert, Animated, Image, ImageBackground, Linking, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import * as Location from 'expo-location';
 import { BlurView } from 'expo-blur';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -24,11 +24,16 @@ type Props = {
   onOpenChallenge: (challenge: Challenge) => void;
   onRegisterChallenge: (challenge: Challenge) => void;
   onOpenRoute: (routeId: string) => void;
-  onToggleClubMembership: (club: RunningClub) => void;
+  onToggleClubMembership: (club: RunningClub) => boolean | Promise<boolean>;
   onToggleClubEventParticipation: (event: ClubEvent) => void;
   onToggleFollow: (runnerId: string) => void;
   onRemoveRunner: (runnerId: string) => void;
   onPostSocialChange: (postId: string, patch: Partial<Pick<Post, 'likeCount' | 'commentCount' | 'likedByMe' | 'isFollowing'>>) => void;
+};
+
+type ProfilePreview = Runner & {
+  postCount?: number;
+  latestPostTitle?: string;
 };
 
 type WeatherInfo = {
@@ -41,6 +46,20 @@ type WeatherInfo = {
   temperature: number;
   updatedAt: string;
   windSpeed: number;
+};
+
+type RunnerWeeklyRun = {
+  id: string;
+  label: string;
+  dateLabel: string;
+  distanceKm: number;
+  duration: string;
+  pace: string;
+  calories: number;
+  routeTitle: string;
+  routeArea: string;
+  image: string;
+  completedAt: string;
 };
 
 type AchievementCategory =
@@ -77,6 +96,49 @@ const WEATHER_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
 const scrollHintColors = ['rgba(35,45,53,0)', 'rgba(35,45,53,0.18)', 'rgba(35,45,53,0.42)'] as const;
 const scrollHintStart = { x: 0, y: 0 };
 const scrollHintEnd = { x: 1, y: 0 };
+const marathonMedalImage = 'https://cdn-icons-png.flaticon.com/512/2583/2583344.png';
+
+function getSeedValue(value: string) {
+  return value.split('').reduce((sum, character) => sum + character.charCodeAt(0), 0);
+}
+
+function pickProfileItems<T>(items: T[], seed: string, count: number) {
+  if (!items.length) return [];
+  const offset = getSeedValue(seed) % items.length;
+  return [...items.slice(offset), ...items.slice(0, offset)].slice(0, count);
+}
+
+function buildRunnerWeeklyRuns(runner: ProfilePreview | null, routes: RouteOption[]): RunnerWeeklyRun[] {
+  if (!runner) return [];
+  const seed = getSeedValue(runner.id);
+  const labels = ['Да', 'Мя', 'Лх', 'Пү', 'Ба', 'Бя', 'Ня'];
+  const fallbackRoute = routes[0];
+  const today = new Date();
+
+  return labels.map((label, index) => {
+    const route = routes.length ? routes[(seed + index) % routes.length] : fallbackRoute;
+    const distanceKm = Number((2.6 + ((seed + index * 17) % 58) / 10).toFixed(1));
+    const durationMinutes = Math.round(distanceKm * (5.2 + ((seed + index) % 18) / 10));
+    const paceMinutes = Math.floor(durationMinutes / distanceKm);
+    const paceSeconds = Math.round(((durationMinutes / distanceKm) - paceMinutes) * 60);
+    const date = new Date(today);
+    date.setDate(today.getDate() - (6 - index));
+
+    return {
+      id: `${runner.id}-week-${index}`,
+      label,
+      dateLabel: date.toLocaleDateString('mn-MN', { month: 'short', day: 'numeric', weekday: 'long' }),
+      distanceKm,
+      duration: `${Math.floor(durationMinutes / 60)}ц ${String(durationMinutes % 60).padStart(2, '0')}м`,
+      pace: `${paceMinutes}:${String(paceSeconds).padStart(2, '0')} /км`,
+      calories: Math.round(distanceKm * 62),
+      routeTitle: route?.title ?? 'Өөрийн маршрут',
+      routeArea: route?.area ?? 'GPS зам',
+      image: route?.image ?? runner.avatar,
+      completedAt: date.toLocaleTimeString('mn-MN', { hour: '2-digit', minute: '2-digit' })
+    };
+  });
+}
 const weatherClearGradient = ['rgba(9,40,64,0.96)', 'rgba(8,76,62,0.88)', 'rgba(5,11,26,0.96)'] as const;
 const weatherCloudGradient = ['rgba(30,41,59,0.98)', 'rgba(15,31,52,0.94)', 'rgba(5,11,26,0.96)'] as const;
 const weatherRainGradient = ['rgba(15,23,42,0.98)', 'rgba(12,74,110,0.74)', 'rgba(5,11,26,0.98)'] as const;
@@ -97,6 +159,24 @@ function formatClubEventDate(value: string) {
     hour: '2-digit',
     minute: '2-digit'
   });
+}
+
+function getEventRegistrationCountdown(value: string) {
+  const registrationEndsAt = new Date(value).getTime() - 60 * 60 * 1000;
+  const remainingSeconds = Math.max(0, Math.floor((registrationEndsAt - Date.now()) / 1000));
+  const days = Math.floor(remainingSeconds / 86400);
+  const hours = Math.floor((remainingSeconds % 86400) / 3600);
+  const minutes = Math.floor((remainingSeconds % 3600) / 60);
+
+  if (remainingSeconds <= 0) {
+    return 'Бүртгэл хаагдсан';
+  }
+
+  if (days > 0) {
+    return `${days} өдөр ${hours} цаг`;
+  }
+
+  return `${hours} цаг ${minutes} мин`;
 }
 
 const ACHIEVEMENT_CATEGORIES: { key: AchievementCategory; label: string }[] = [
@@ -201,41 +281,24 @@ function getWeatherMood(condition?: string): WeatherMood {
   return 'clear';
 }
 
-function getWeatherSymbol(condition?: string) {
-  const mood = getWeatherMood(condition);
-  if (mood === 'rain') return '≋';
-  if (mood === 'snow') return '✦';
-  if (mood === 'storm') return 'ϟ';
-  if (mood === 'cloudy') return '◒';
-  return '☼';
-}
-
-function getAqiLabel(aqi: number | null) {
-  if (aqi === null) {
-    return 'Тодорхойгүй';
-  }
-
-  if (aqi <= 50) {
-    return 'Сайн';
-  }
-
-  if (aqi <= 100) {
-    return 'Дунд';
-  }
-
-  if (aqi <= 150) {
-    return 'Эмзэг хүмүүст муу';
-  }
-
-  if (aqi <= 200) {
-    return 'Муу';
-  }
-
-  if (aqi <= 300) {
-    return 'Маш муу';
-  }
-
-  return 'Аюултай';
+function WeatherSceneIcon({ mood }: { mood: WeatherMood }) {
+  return (
+    <View style={styles.weatherSceneIcon}>
+      {mood !== 'snow' && mood !== 'storm' ? (
+        <>
+          <View style={styles.iconSun} />
+          <View style={[styles.sunRay, styles.sunRayTop]} />
+          <View style={[styles.sunRay, styles.sunRayRight]} />
+          <View style={[styles.sunRay, styles.sunRayAngle]} />
+        </>
+      ) : null}
+      <View style={styles.iconCloudMain} />
+      <View style={styles.iconCloudLeft} />
+      <View style={styles.iconCloudTop} />
+      {mood === 'storm' ? <View style={styles.iconRainWrap}>{[0, 1, 2].map(index => <View key={index} style={[styles.iconRainDrop, { left: index * 16 }]} />)}</View> : null}
+      {mood === 'snow' ? <Text style={styles.iconSnow}>✦</Text> : null}
+    </View>
+  );
 }
 
 function getRunningNote(weather: Pick<WeatherInfo, 'aqi' | 'condition' | 'temperature' | 'windSpeed'>) {
@@ -329,9 +392,17 @@ function WeatherMotionBackground({ mood }: { mood: WeatherMood }) {
         end={{ x: 1, y: 1 }}
         style={styles.weatherSkyGradient}
       />
+      <LinearGradient
+        colors={mood === 'clear' ? ['rgba(251,191,36,0.22)', 'rgba(14,165,233,0.06)', 'rgba(2,6,23,0.2)'] : mood === 'snow' ? ['rgba(226,232,240,0.24)', 'rgba(103,232,249,0.08)', 'rgba(2,6,23,0.28)'] : ['rgba(148,163,184,0.2)', 'rgba(56,189,248,0.08)', 'rgba(2,6,23,0.34)']}
+        start={{ x: 0.2, y: 0 }}
+        end={{ x: 0.8, y: 1 }}
+        style={styles.weatherAtmosphere}
+      />
+      <View style={styles.weatherHorizon} />
       {mood === 'clear' ? (
         <>
           <Animated.View style={[styles.sunGlow, { opacity: pulse }]} />
+          <View style={styles.sunDisc} />
           <Animated.View style={[styles.weatherLightBand, { transform: [{ translateX: driftX }, { rotate: '-10deg' }] }]} />
         </>
       ) : null}
@@ -339,6 +410,7 @@ function WeatherMotionBackground({ mood }: { mood: WeatherMood }) {
         <>
           <Animated.View style={[styles.cloudBand, styles.cloudBandOne, { transform: [{ translateX: driftX }] }]} />
           <Animated.View style={[styles.cloudBand, styles.cloudBandTwo, { transform: [{ translateX: reverseDriftX }] }]} />
+          <Animated.View style={[styles.cloudBand, styles.cloudBandThree, { transform: [{ translateX: driftX }] }]} />
         </>
       ) : null}
       {mood === 'rain' || mood === 'storm' ? (
@@ -356,6 +428,10 @@ function WeatherMotionBackground({ mood }: { mood: WeatherMood }) {
         </Animated.View>
       ) : null}
       {mood === 'storm' ? <Animated.View style={[styles.stormFlash, { opacity: flash }]} /> : null}
+      <LinearGradient
+        colors={['rgba(4,10,16,0.04)', 'rgba(4,10,16,0.34)', 'rgba(4,10,16,0.72)']}
+        style={styles.weatherReadabilityShade}
+      />
     </View>
   );
 }
@@ -382,6 +458,7 @@ export function HomeScreen({
 }: Props) {
   const homeChallenges = challenges.filter(challenge => challenge.group === '5k');
   const corporateChallenges = challenges.filter(challenge => challenge.group === '10k');
+  const marathonChallenges = challenges.filter(challenge => challenge.group === 'marathon');
   const [weather, setWeather] = useState<WeatherInfo | null>(null);
   const [weatherLoading, setWeatherLoading] = useState(true);
   const [weatherError, setWeatherError] = useState<string | null>(null);
@@ -391,6 +468,12 @@ export function HomeScreen({
   const [galleryImageIndex, setGalleryImageIndex] = useState<number | null>(null);
   const [clubPageOpen, setClubPageOpen] = useState(false);
   const [selectedClubEvent, setSelectedClubEvent] = useState<ClubEvent | null>(null);
+  const [joinedEventNotice, setJoinedEventNotice] = useState<ClubEvent | null>(null);
+  const [joinedClubNotice, setJoinedClubNotice] = useState<RunningClub | null>(null);
+  const [selectedRunner, setSelectedRunner] = useState<ProfilePreview | null>(null);
+  const [selectedRunnerRun, setSelectedRunnerRun] = useState<RunnerWeeklyRun | null>(null);
+  const [runnerDirectoryOpen, setRunnerDirectoryOpen] = useState(false);
+  const [runnerSearchQuery, setRunnerSearchQuery] = useState('');
   const askedWeatherPermission = useRef(false);
   const unlockPulse = useRef(new Animated.Value(0)).current;
   const routeScrollX = useRef(new Animated.Value(0)).current;
@@ -405,6 +488,83 @@ export function HomeScreen({
   const unlockedCount = ACHIEVEMENTS.filter(achievement => achievement.unlocked).length;
   const selectedClub = clubs.find(club => club.id === selectedClubId) ?? null;
   const selectedClubEvents = clubEvents.filter(event => event.clubId === selectedClubId);
+  const profileCompletedEvents = useMemo(
+    () => pickProfileItems(clubEvents, selectedRunner?.id ?? 'runner', 3),
+    [clubEvents, selectedRunner?.id]
+  );
+  const profileCompletedChallenges = useMemo(
+    () => pickProfileItems(challenges.filter(challenge => challenge.group !== 'marathon'), selectedRunner?.id ?? 'runner', 3),
+    [challenges, selectedRunner?.id]
+  );
+  const profileCompletedMarathons = useMemo(
+    () => pickProfileItems(challenges.filter(challenge => challenge.group === 'marathon'), selectedRunner?.id ?? 'runner', 2),
+    [challenges, selectedRunner?.id]
+  );
+  const selectedRunnerWeeklyRuns = useMemo(
+    () => buildRunnerWeeklyRuns(selectedRunner, routes),
+    [routes, selectedRunner]
+  );
+  const selectedRunnerMaxWeeklyKm = Math.max(1, ...selectedRunnerWeeklyRuns.map(run => run.distanceKm));
+  const activeRunners = useMemo<ProfilePreview[]>(
+    () => [...runners]
+      .sort((first, second) => second.totalKm - first.totalKm)
+      .map(runner => {
+        const runnerPosts = posts.filter(post => post.userId === runner.id || post.user === runner.name);
+        return {
+          ...runner,
+          postCount: runnerPosts.length,
+          latestPostTitle: runnerPosts[0]?.title
+        };
+      }),
+    [posts, runners]
+  );
+  const visibleActiveRunners = useMemo(() => {
+    const query = runnerSearchQuery.trim().toLowerCase();
+    if (!query) return activeRunners;
+    return activeRunners.filter(runner => runner.name.toLowerCase().includes(query));
+  }, [activeRunners, runnerSearchQuery]);
+  const selectedClubSocials = selectedClub ? [
+    { key: 'facebook', icon: 'f', label: 'Facebook', url: selectedClub.socialLinks?.facebook, backgroundColor: '#1877F2', textColor: '#FFFFFF' },
+    { key: 'instagram', icon: 'IG', label: 'Instagram', url: selectedClub.socialLinks?.instagram, backgroundColor: '#E4405F', textColor: '#FFFFFF' },
+    { key: 'website', icon: 'www', label: 'Web', url: selectedClub.socialLinks?.website, backgroundColor: colors.accent, textColor: '#071006' }
+  ] : [];
+  const joinClubEventFromDetail = (event: ClubEvent) => {
+    if (!joinedClubEventIds.includes(event.id)) {
+      onToggleClubEventParticipation(event);
+    }
+    setSelectedClubEvent(null);
+    setJoinedEventNotice(event);
+  };
+  const toggleClubMembership = async (club: RunningClub) => {
+    const wasJoined = Boolean(club.joined);
+    const changed = await onToggleClubMembership(club);
+    if (changed && !wasJoined) {
+      setJoinedClubNotice({ ...club, joined: true });
+    }
+  };
+  const openSocialLink = (label: string, url?: string) => {
+    const trimmed = url?.trim();
+    if (!trimmed) {
+      Alert.alert(label, 'Club admin дээр энэ social link-ийг оруулж хадгална уу.');
+      return;
+    }
+    const target = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+    void Linking.openURL(target).catch(() => Alert.alert(label, 'Энэ холбоосыг нээж чадсангүй.'));
+  };
+  const openPostAuthorProfile = (post: Post) => {
+    const runnerMatch = runners.find(runner => runner.id === post.userId || runner.name === post.user);
+    const authorPosts = posts.filter(item => (
+      post.userId ? item.userId === post.userId : item.user === post.user
+    ));
+    setSelectedRunner({
+      id: post.userId ?? `post-author-${post.user}`,
+      name: post.user,
+      avatar: post.userAvatar ?? runnerMatch?.avatar ?? 'https://images.unsplash.com/photo-1552674605-db6ffd4facb5?w=300&q=80',
+      totalKm: runnerMatch?.totalKm ?? authorPosts.reduce((sum, item) => sum + (item.distanceKm ?? 0), 0),
+      postCount: authorPosts.length || 1,
+      latestPostTitle: post.title
+    });
+  };
 
   const updateWeather = useCallback(async () => {
     setWeatherLoading(true);
@@ -530,34 +690,26 @@ export function HomeScreen({
       </View>
 
       <BlurView intensity={42} tint="dark" style={styles.weatherCard}>
-        <WeatherMotionBackground mood={getWeatherMood(weather?.condition)} />
+        <WeatherMotionBackground mood="cloudy" />
         <View style={styles.weatherContent}>
-          <View style={styles.weatherHeaderRow}>
-            <View>
-              <Text style={styles.weatherLocation}>УЛААНБААТАР</Text>
-              <Text style={styles.weatherDate}>{weather?.dateLabel ?? 'Цаг агаар'}{weather?.updatedAt ? ` · ${weather.updatedAt}` : ''}</Text>
-            </View>
-            <Text style={styles.weatherSymbol}>{getWeatherSymbol(weather?.condition)}</Text>
-          </View>
-
           <View style={styles.weatherHeroRow}>
             <View style={styles.weatherMain}>
-              <View style={styles.temperatureRow}>
-                <Text style={styles.weatherTemp}>{weather ? `${weather.temperature > 0 ? '+' : ''}${weather.temperature}°` : '--°'}</Text>
-                <View>
-                  <Text style={styles.weatherCondition}>{weather?.condition ?? 'Шинэчилж байна'}</Text>
-                  <View style={styles.runReadyBadge}><View style={styles.runReadyDot}/><Text style={styles.runReadyText}>{weather?.aqi !== null && weather?.aqi !== undefined && weather.aqi <= 100 ? 'ГҮЙХЭД ТОХИРОМЖТОЙ' : 'АНХААРАЛТАЙ ГҮЙХ'}</Text></View>
-                </View>
+              <Text style={styles.weatherTemp}>{weather ? `${weather.temperature > 0 ? '+' : ''}${weather.temperature}°` : '--°'}</Text>
+              <Text style={styles.weatherCondition}>{weatherError ? 'Мэдээлэл алга' : weather?.condition ?? (weatherLoading ? 'Шинэчилж байна' : 'Тодорхойгүй')}</Text>
+              <View style={styles.runReadyBadge}>
+                <View style={styles.runReadyDot}/>
+                <Text style={styles.runReadyText}>{weather?.aqi !== null && weather?.aqi !== undefined && weather.aqi <= 100 ? 'ГҮЙХ/АЛХАХАД ТОХИРОМЖТОЙ' : 'АНХААРАЛТАЙ ГҮЙХ/АЛХАХ'}</Text>
               </View>
             </View>
-            <View style={styles.aqiBadge}>
-              <Text style={styles.aqiLabel}>АГААР</Text>
-              <Text style={styles.aqiValue}>{weather?.aqi ?? '--'}</Text>
-              <Text style={styles.aqiText}>{getAqiLabel(weather?.aqi ?? null)}</Text>
-            </View>
+            <WeatherSceneIcon mood={getWeatherMood(weather?.condition)} />
           </View>
 
           <View style={styles.weatherMiniRow}>
+            <View style={styles.weatherMiniStat}>
+              <Text style={styles.weatherMiniLabel}>МЭДРЭГДЭХ</Text>
+              <Text style={styles.weatherMiniValue}>{weather ? `${weather.temperature > 0 ? '+' : ''}${weather.temperature}°` : '--'}</Text>
+            </View>
+            <View style={styles.weatherMiniDivider}/>
             <View style={styles.weatherMiniStat}>
               <Text style={styles.weatherMiniLabel}>ЧИЙГШИЛ</Text>
               <Text style={styles.weatherMiniValue}>{weather ? `${weather.humidity}%` : '--'}</Text>
@@ -567,19 +719,6 @@ export function HomeScreen({
               <Text style={styles.weatherMiniLabel}>САЛХИ</Text>
               <Text style={styles.weatherMiniValue}>{weather ? `${weather.windSpeed} м/с` : '--'}</Text>
             </View>
-            <View style={styles.weatherMiniDivider}/>
-            <View style={styles.weatherMiniStat}>
-              <Text style={styles.weatherMiniLabel}>ТӨЛӨВ</Text>
-              <Text style={styles.weatherMiniValue}>Одоо</Text>
-            </View>
-          </View>
-
-          <View style={styles.weatherNoteRow}>
-            <View style={styles.weatherNoteIcon}><Text style={styles.weatherNoteIconText}>i</Text></View>
-            <Text numberOfLines={2} style={styles.weatherNote}>
-              {weatherError ?? weather?.note ?? (weatherLoading ? 'Одоогийн цаг агаарын мэдээллийг шинэчилж байна.' : 'Цаг агаарын мэдээлэл түр боломжгүй байна.')}
-              {weather?.isFallbackLocation ? ' Улаанбаатарын мэдээлэл ашиглав.' : ''}
-            </Text>
           </View>
         </View>
       </BlurView>
@@ -627,7 +766,7 @@ export function HomeScreen({
       <View style={styles.horizontalHintWrap}>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.clubEventRow}>
           {clubEvents.map(event => (
-            <Pressable key={event.id} style={styles.clubEventCard} onPress={() => setSelectedClubId(event.clubId)}>
+            <Pressable key={event.id} style={styles.clubEventCard} onPress={() => setSelectedClubEvent(event)}>
               <ImageBackground source={{ uri: event.image }} imageStyle={styles.clubEventImage} style={styles.clubEventImageWrap}>
                 <View style={styles.clubEventDateBadge}><Text style={styles.clubEventDate}>{formatClubEventDate(event.startsAt)}</Text></View>
               </ImageBackground>
@@ -721,6 +860,33 @@ export function HomeScreen({
               </View>
             );
           })}
+        </ScrollView>
+        <LinearGradient pointerEvents="none" colors={scrollHintColors} start={scrollHintStart} end={scrollHintEnd} style={styles.scrollEdgeHint} />
+      </View>
+
+      <View style={styles.sectionHeader}>
+        <Text style={styles.sectionTitle}>Холын зайн Марафон</Text>
+      </View>
+
+      <View style={styles.horizontalHintWrap}>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.discoveryRow}>
+          {marathonChallenges.map(challenge => (
+            <Pressable key={challenge.id} style={styles.discoveryCard} onPress={() => onOpenChallenge(challenge)}>
+              <ImageBackground source={{ uri: challenge.image }} imageStyle={styles.discoveryImage} style={styles.discoveryImageWrap}>
+                <View style={styles.discoveryShade}>
+                  <View style={styles.marathonMedalBadge}>
+                    <Image source={{ uri: marathonMedalImage }} style={styles.marathonMedalImage} />
+                  </View>
+                  <View>
+                    <Text style={styles.discoveryTitle}>{challenge.title}</Text>
+                    <Text style={styles.discoveryMeta}>
+                      {challenge.org} · {joinedChallengeIds.includes(challenge.id) ? 'Бүртгүүлсэн' : 'Оролцох'}
+                    </Text>
+                  </View>
+                </View>
+              </ImageBackground>
+            </Pressable>
+          ))}
         </ScrollView>
         <LinearGradient pointerEvents="none" colors={scrollHintColors} start={scrollHintStart} end={scrollHintEnd} style={styles.scrollEdgeHint} />
       </View>
@@ -876,7 +1042,13 @@ export function HomeScreen({
 
       <View style={styles.sectionHeader}>
         <Text style={styles.sectionTitle}>Санал болгох гүйгчид</Text>
-        <Text style={styles.sectionLink}>Бүгдийг харах</Text>
+        <Pressable
+          hitSlop={8}
+          style={({ pressed }) => [styles.sectionLinkButton, pressed && styles.sectionLinkPressed]}
+          onPress={() => setRunnerDirectoryOpen(true)}
+        >
+          <Text style={styles.sectionLink}>Бүгдийг харах</Text>
+        </Pressable>
       </View>
 
       <View style={styles.horizontalHintWrap}>
@@ -884,7 +1056,7 @@ export function HomeScreen({
           {runners.map(runner => {
             const followed = followedRunnerIds.includes(runner.id);
             return (
-              <View key={runner.id} style={styles.runnerCard}>
+              <Pressable key={runner.id} style={({ pressed }) => [styles.runnerCard, pressed && styles.runnerCardPressed]} onPress={() => setSelectedRunner(runner)}>
                 <View style={styles.runnerAvatar}>
                   <ImageBackground source={{ uri: runner.avatar }} imageStyle={styles.runnerImage} style={styles.runnerImageWrap} />
                 </View>
@@ -893,15 +1065,24 @@ export function HomeScreen({
                 <View style={styles.runnerActions}>
                   <Pressable
                     style={[styles.followButton, followed && styles.followingButton]}
-                    onPress={() => onToggleFollow(runner.id)}
+                    onPress={event => {
+                      event.stopPropagation();
+                      onToggleFollow(runner.id);
+                    }}
                   >
                     <Text style={styles.followText}>{followed ? 'Following' : 'Follow'}</Text>
                   </Pressable>
-                  <Pressable style={styles.removeButton} onPress={() => onRemoveRunner(runner.id)}>
+                  <Pressable
+                    style={styles.removeButton}
+                    onPress={event => {
+                      event.stopPropagation();
+                      onRemoveRunner(runner.id);
+                    }}
+                  >
                     <Text style={styles.removeText}>Remove</Text>
                   </Pressable>
                 </View>
-              </View>
+              </Pressable>
             );
           })}
         </ScrollView>
@@ -928,7 +1109,12 @@ export function HomeScreen({
         >
           {posts.map(post => (
             <View key={post.id} style={styles.postSlide}>
-              <PostCard post={post} currentUserId={currentUserId} onSocialChange={onPostSocialChange} />
+              <PostCard
+                post={post}
+                currentUserId={currentUserId}
+                onOpenAuthor={openPostAuthorProfile}
+                onSocialChange={onPostSocialChange}
+              />
             </View>
           ))}
         </ScrollView>
@@ -967,6 +1153,32 @@ export function HomeScreen({
                 </View>
 
                 <Text style={styles.clubDescription}>{selectedClub.description}</Text>
+
+                <View style={styles.clubModalContactSection}>
+                  <Text style={styles.clubModalSectionTitle}>Холбоо барих</Text>
+                  <Text style={styles.clubModalContact}>{selectedClub.meetingInfo}</Text>
+                  <View style={styles.clubModalSocialRow}>
+                    {selectedClubSocials.map(item => (
+                      <Pressable
+                        key={item.key}
+                        accessibilityLabel={`${item.label} нээх`}
+                        style={[
+                          styles.clubModalSocialButton,
+                          { backgroundColor: item.url ? item.backgroundColor : 'rgba(255,255,255,0.08)' },
+                          !item.url && styles.clubModalSocialButtonDisabled
+                        ]}
+                        onPress={() => openSocialLink(item.label, item.url)}
+                      >
+                        <Text style={[
+                          styles.clubModalSocialIcon,
+                          item.key === 'website' && styles.clubModalSocialWebIcon,
+                          { color: item.url ? item.textColor : '#92A4AA' }
+                        ]}>{item.icon}</Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                </View>
+
                 <View style={styles.clubGallerySection}>
                   <View style={styles.clubGalleryHeader}>
                     <Text style={styles.clubGalleryTitle}>Клубын зургууд</Text>
@@ -985,24 +1197,41 @@ export function HomeScreen({
 
                 {selectedClubEvents.length ? (
                   <View style={styles.clubModalEvents}>
-                    <Text style={styles.clubModalEventsTitle}>Ойрын арга хэмжээ</Text>
-                    {selectedClubEvents.map(event => (
-                      <View key={event.id} style={styles.clubModalEventRow}>
-                        <View style={styles.clubModalEventDate}><Text style={styles.clubModalEventDateText}>{formatClubEventDate(event.startsAt)}</Text></View>
-                        <View style={styles.clubModalEventCopy}><Text style={styles.clubModalEventTitle}>{event.title}</Text><Text style={styles.clubModalEventMeta}>{event.location}{event.distanceKm ? ` · ${event.distanceKm} км` : ''}</Text></View>
-                      </View>
-                    ))}
+                    <View style={styles.clubModalEventsHeader}>
+                      <Text style={styles.clubModalEventsTitle}>Ойрын арга хэмжээ</Text>
+                      <Text style={styles.clubModalEventsCount}>{selectedClubEvents.length} арга хэмжээ</Text>
+                    </View>
+                    <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.clubModalEventRow}>
+                      {selectedClubEvents.map(event => (
+                        <Pressable key={event.id} style={styles.clubModalEventCard} onPress={() => setSelectedClubEvent(event)}>
+                          <ImageBackground source={{ uri: event.image }} imageStyle={styles.clubModalEventImage} style={styles.clubModalEventImageWrap}>
+                            <View style={styles.clubModalEventDate}><Text style={styles.clubModalEventDateText}>{formatClubEventDate(event.startsAt)}</Text></View>
+                          </ImageBackground>
+                          <View style={styles.clubModalEventCopy}>
+                            <Text numberOfLines={2} style={styles.clubModalEventTitle}>{event.title}</Text>
+                            <Text numberOfLines={1} style={styles.clubModalEventMeta}>{event.location}{event.distanceKm ? ` · ${event.distanceKm} км` : ''}</Text>
+                          </View>
+                        </Pressable>
+                      ))}
+                    </ScrollView>
                   </View>
                 ) : null}
 
-                <Pressable style={styles.clubVisitButton} onPress={() => setClubPageOpen(true)}>
-                  <Text style={styles.clubVisitText}>Клуб руу зочлох</Text>
-                  <Text style={styles.clubVisitArrow}>›</Text>
-                </Pressable>
+                <View style={styles.clubJoinInfoCard}>
+                  <View style={styles.clubJoinInfoIcon}><Text style={styles.clubJoinInfoIconText}>{selectedClub.joined ? '✓' : '+'}</Text></View>
+                  <View style={styles.clubJoinInfoCopy}>
+                    <Text style={styles.clubJoinInfoTitle}>{selectedClub.joined ? 'Клубт нэгдсэн байна' : 'Клубт нэгдээд эхлээрэй'}</Text>
+                    <Text style={styles.clubJoinInfoText}>
+                      {selectedClub.joined
+                        ? (selectedClubEvents[0] ? `Дараагийн арга хэмжээ: ${selectedClubEvents[0].title}` : 'Клубын шинэ арга хэмжээ, гүйлтүүд энд харагдана.')
+                        : 'Нэгдсэний дараа клубын арга хэмжээ, гишүүдийн идэвх болон мэдэгдлүүдийг дагана.'}
+                    </Text>
+                  </View>
+                </View>
 
                 <Pressable
                   style={[styles.clubJoinButton, selectedClub.joined && styles.clubLeaveButton]}
-                  onPress={() => onToggleClubMembership(selectedClub)}
+                  onPress={() => void toggleClubMembership(selectedClub)}
                 >
                   <Text style={[styles.clubJoinText, selectedClub.joined && styles.clubLeaveText]}>{selectedClub.joined ? 'Клубээс гарах' : 'Клубт нэгдэх'}</Text>
                 </Pressable>
@@ -1041,22 +1270,42 @@ export function HomeScreen({
               </View>
 
               <View style={styles.clubPageSection}>
+                <Text style={styles.clubPageSectionTitle}>Холбоо барих</Text>
+                <Text style={styles.clubPageContact}>{selectedClub.meetingInfo}</Text>
+                <View style={styles.clubSocialRow}>
+                  {selectedClubSocials.map(item => (
+                    <Pressable
+                      key={item.key}
+                      accessibilityLabel={item.label}
+                      style={[styles.clubSocialButton, { backgroundColor: item.backgroundColor }, !item.url?.trim() && styles.clubSocialButtonDisabled]}
+                      onPress={() => openSocialLink(item.label, item.url)}
+                    >
+                      <Text style={[styles.clubSocialIcon, { color: item.textColor }, item.key === 'website' && styles.clubSocialWebIcon]}>{item.icon}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+              </View>
+
+              <View style={styles.clubPageSection}>
                 <View style={styles.clubPageSectionHeader}><Text style={styles.clubPageSectionTitle}>Төлөвлөсөн арга хэмжээнүүд</Text><Text style={styles.clubPageSectionCount}>{selectedClubEvents.length}</Text></View>
                 {selectedClubEvents.length ? selectedClubEvents.map(event => (
-                  <View key={event.id} style={styles.clubPageEvent}>
+                  <Pressable key={event.id} style={styles.clubPageEvent} onPress={() => setSelectedClubEvent(event)}>
                     <ImageBackground source={{ uri: event.image }} imageStyle={styles.clubPageEventImage} style={styles.clubPageEventImageWrap} />
                     <View style={styles.clubPageEventCopy}>
                       <Text style={styles.clubPageEventDate}>{formatClubEventDate(event.startsAt)}</Text>
                       <Text style={styles.clubPageEventTitle}>{event.title}</Text>
                       <Text style={styles.clubPageEventMeta}>{event.location}{event.distanceKm ? ` · ${event.distanceKm} км` : ''}</Text>
                       <View style={styles.clubPageEventActions}>
-                        <Pressable style={[styles.clubPageEventJoin, joinedClubEventIds.includes(event.id) && styles.clubPageEventJoined]} onPress={() => onToggleClubEventParticipation(event)}>
+                        <Pressable style={[styles.clubPageEventJoin, joinedClubEventIds.includes(event.id) && styles.clubPageEventJoined]} onPress={pressEvent => {
+                          pressEvent.stopPropagation();
+                          joinClubEventFromDetail(event);
+                        }}>
                           <Text style={[styles.clubPageEventJoinText, joinedClubEventIds.includes(event.id) && styles.clubPageEventJoinedText]}>{joinedClubEventIds.includes(event.id) ? 'Оролцоно' : 'Оролцох'}</Text>
                         </Pressable>
                         <Pressable style={styles.clubPageEventDetails} onPress={() => setSelectedClubEvent(event)}><Text style={styles.clubPageEventDetailsText}>Дэлгэрэнгүй</Text></Pressable>
                       </View>
                     </View>
-                  </View>
+                  </Pressable>
                 )) : <View style={styles.clubPageEmpty}><Text style={styles.clubPageEmptyText}>Одоогоор төлөвлөсөн арга хэмжээ алга.</Text></View>}
               </View>
 
@@ -1071,7 +1320,7 @@ export function HomeScreen({
                 </ScrollView>
               </View>
 
-              <Pressable style={[styles.clubPageJoin, selectedClub.joined && styles.clubPageJoined]} onPress={() => onToggleClubMembership(selectedClub)}>
+              <Pressable style={[styles.clubPageJoin, selectedClub.joined && styles.clubPageJoined]} onPress={() => void toggleClubMembership(selectedClub)}>
                 <Text style={[styles.clubPageJoinText, selectedClub.joined && styles.clubPageJoinedText]}>{selectedClub.joined ? 'Клубээс гарах' : 'Клубт нэгдэх'}</Text>
               </Pressable>
             </ScrollView>
@@ -1092,16 +1341,352 @@ export function HomeScreen({
                   </LinearGradient>
                 </ImageBackground>
                 <View style={styles.eventDetailMetaRow}>
-                  <View style={styles.eventDetailMetaItem}><Text style={styles.eventDetailMetaValue}>{formatClubEventDate(selectedClubEvent.startsAt)}</Text><Text style={styles.eventDetailMetaLabel}>Огноо, цаг</Text></View>
+                  <View style={styles.eventDetailMetaItem}><Text style={styles.eventDetailMetaValue}>{formatClubEventDate(selectedClubEvent.startsAt)}</Text><Text style={styles.eventDetailMetaLabel}>Эхлэх цаг</Text></View>
                   <View style={styles.eventDetailMetaDivider} />
-                  <View style={styles.eventDetailMetaItem}><Text style={styles.eventDetailMetaValue}>{selectedClubEvent.distanceKm ? `${selectedClubEvent.distanceKm} км` : 'Нээлттэй'}</Text><Text style={styles.eventDetailMetaLabel}>Зай</Text></View>
+                  <View style={styles.eventDetailMetaItem}><Text style={styles.eventDetailMetaValue}>{getEventRegistrationCountdown(selectedClubEvent.startsAt)}</Text><Text style={styles.eventDetailMetaLabel}>Бүртгэл дуусах</Text></View>
                   <View style={styles.eventDetailMetaDivider} />
-                  <View style={styles.eventDetailMetaItem}><Text style={styles.eventDetailMetaValue}>{selectedClubEvent.participantCount}</Text><Text style={styles.eventDetailMetaLabel}>Оролцогч</Text></View>
+                  <View style={styles.eventDetailMetaItem}><Text style={styles.eventDetailMetaValue}>{selectedClubEvent.participantCount}</Text><Text style={styles.eventDetailMetaLabel}>Бүртгэгдсэн</Text></View>
                 </View>
-                <View style={styles.eventDetailSection}><Text style={styles.eventDetailSectionTitle}>Ерөнхий мэдээлэл</Text><Text style={styles.eventDetailDescription}>{selectedClubEvent.description}</Text><Text style={styles.eventDetailLocation}>⌖ {selectedClubEvent.location}</Text></View>
-                <View style={styles.eventDetailSection}><Text style={styles.eventDetailSectionTitle}>Бэлтгэлийн зөвлөмж</Text>{selectedClubEvent.advice.map((advice, index) => <View key={`${advice}-${index}`} style={styles.eventAdviceRow}><View style={styles.eventAdviceNumber}><Text style={styles.eventAdviceNumberText}>{index + 1}</Text></View><Text style={styles.eventAdviceText}>{advice}</Text></View>)}</View>
-                <Pressable style={[styles.eventDetailJoin, joinedClubEventIds.includes(selectedClubEvent.id) && styles.eventDetailJoined]} onPress={() => onToggleClubEventParticipation(selectedClubEvent)}><Text style={[styles.eventDetailJoinText, joinedClubEventIds.includes(selectedClubEvent.id) && styles.eventDetailJoinedText]}>{joinedClubEventIds.includes(selectedClubEvent.id) ? 'Оролцохоо болих' : 'Арга хэмжээнд оролцох'}</Text></Pressable>
+                <View style={styles.eventDetailQuickGrid}>
+                  <View style={styles.eventDetailQuickItem}><Text style={styles.eventDetailQuickValue}>{selectedClubEvent.distanceKm ? `${selectedClubEvent.distanceKm} км` : 'Нээлттэй'}</Text><Text style={styles.eventDetailQuickLabel}>Гүйлтийн зай</Text></View>
+                  <View style={styles.eventDetailQuickItem}><Text style={styles.eventDetailQuickValue}>{selectedClubEvent.location}</Text><Text style={styles.eventDetailQuickLabel}>Зохиогдох байршил</Text></View>
+                </View>
+                <View style={styles.eventDetailSection}><Text style={styles.eventDetailSectionTitle}>Тайлбар</Text><Text style={styles.eventDetailDescription}>{selectedClubEvent.description}</Text></View>
+                <View style={styles.eventDetailSection}><Text style={styles.eventDetailSectionTitle}>Санамж</Text>{selectedClubEvent.advice.map((advice, index) => <View key={`${advice}-${index}`} style={styles.eventAdviceRow}><View style={styles.eventAdviceNumber}><Text style={styles.eventAdviceNumberText}>{index + 1}</Text></View><Text style={styles.eventAdviceText}>{advice}</Text></View>)}</View>
+                <Pressable
+                  disabled={joinedClubEventIds.includes(selectedClubEvent.id)}
+                  style={[styles.eventDetailJoin, joinedClubEventIds.includes(selectedClubEvent.id) && styles.eventDetailJoined]}
+                  onPress={() => joinClubEventFromDetail(selectedClubEvent)}
+                >
+                  <Text style={[styles.eventDetailJoinText, joinedClubEventIds.includes(selectedClubEvent.id) && styles.eventDetailJoinedText]}>{joinedClubEventIds.includes(selectedClubEvent.id) ? 'Профайлд нэмэгдсэн' : 'Арга хэмжээнд нэгдэх'}</Text>
+                </Pressable>
               </ScrollView>
+            </View>
+          ) : null}
+        </View>
+      </Modal>
+
+      <Modal transparent visible={Boolean(joinedEventNotice)} animationType="fade" onRequestClose={() => setJoinedEventNotice(null)}>
+        <View style={styles.eventSuccessRoot}>
+          <Pressable style={styles.eventSuccessBackdrop} onPress={() => setJoinedEventNotice(null)} />
+          {joinedEventNotice ? (
+            <View style={styles.eventSuccessCard}>
+              <View style={styles.eventSuccessMark}><Text style={styles.eventSuccessMarkText}>✓</Text></View>
+              <Text style={styles.eventSuccessTitle}>Танд амжилт хүсье</Text>
+              <Text style={styles.eventSuccessBody}>Event таны профайлд нэмэгдлээ.</Text>
+              <Text style={styles.eventSuccessEvent}>{joinedEventNotice.title}</Text>
+              <Pressable style={styles.eventSuccessButton} onPress={() => setJoinedEventNotice(null)}>
+                <Text style={styles.eventSuccessButtonText}>Ойлголоо</Text>
+              </Pressable>
+            </View>
+          ) : null}
+        </View>
+      </Modal>
+
+      <Modal transparent visible={Boolean(joinedClubNotice)} animationType="fade" onRequestClose={() => setJoinedClubNotice(null)}>
+        <View style={styles.eventSuccessRoot}>
+          <Pressable style={styles.eventSuccessBackdrop} onPress={() => setJoinedClubNotice(null)} />
+          {joinedClubNotice ? (
+            <View style={styles.eventSuccessCard}>
+              <View style={styles.eventSuccessMark}><Text style={styles.eventSuccessMarkText}>✓</Text></View>
+              <Text style={styles.clubSuccessTitle}>Та амжилттай нэгдлээ</Text>
+              <Text style={styles.clubSuccessBody}>Клуб таны профайлд орлоо. Баярлалаа.</Text>
+              <Text style={styles.eventSuccessEvent}>{joinedClubNotice.name}</Text>
+              <Pressable style={styles.eventSuccessButton} onPress={() => setJoinedClubNotice(null)}>
+                <Text style={styles.eventSuccessButtonText}>Ойлголоо</Text>
+              </Pressable>
+            </View>
+          ) : null}
+        </View>
+      </Modal>
+
+      <Modal transparent visible={runnerDirectoryOpen} animationType="slide" onRequestClose={() => setRunnerDirectoryOpen(false)}>
+        <View style={styles.runnerDirectoryBackdrop}>
+          <Pressable style={styles.runnerDirectoryScrim} onPress={() => setRunnerDirectoryOpen(false)} />
+          <View style={styles.runnerDirectorySheet}>
+            <View style={styles.runnerDirectoryHeader}>
+              <View>
+                <Text style={styles.runnerDirectoryEyebrow}>ИДЭВХТЭЙ ГҮЙГЧИД</Text>
+                <Text style={styles.runnerDirectoryTitle}>Санал болгох гүйгчид</Text>
+                <Text style={styles.runnerDirectorySubtitle}>{activeRunners.length} гүйгч нийт км-ээр эрэмбэлэгдсэн</Text>
+              </View>
+              <Pressable accessibilityLabel="Жагсаалт хаах" style={styles.runnerDirectoryClose} onPress={() => setRunnerDirectoryOpen(false)}>
+                <Text style={styles.runnerDirectoryCloseText}>×</Text>
+              </Pressable>
+            </View>
+
+            <View style={styles.runnerSearchBox}>
+              <Text style={styles.runnerSearchIcon}>⌕</Text>
+              <TextInput
+                value={runnerSearchQuery}
+                onChangeText={setRunnerSearchQuery}
+                placeholder="Нэрээр хайх"
+                placeholderTextColor="#8FA1A8"
+                style={styles.runnerSearchInput}
+                autoCapitalize="none"
+                autoCorrect={false}
+              />
+              {runnerSearchQuery ? (
+                <Pressable accessibilityLabel="Хайлт цэвэрлэх" hitSlop={8} onPress={() => setRunnerSearchQuery('')}>
+                  <Text style={styles.runnerSearchClear}>×</Text>
+                </Pressable>
+              ) : null}
+            </View>
+
+            <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.runnerDirectoryList}>
+              {visibleActiveRunners.length ? visibleActiveRunners.map((runner, index) => {
+                const followed = followedRunnerIds.includes(runner.id);
+                const weeklyRuns = Math.max(3, Math.round(runner.totalKm / 420));
+                return (
+                  <Pressable
+                    key={runner.id}
+                    style={({ pressed }) => [styles.runnerDirectoryRow, pressed && styles.runnerDirectoryRowPressed]}
+                    onPress={() => {
+                      setRunnerDirectoryOpen(false);
+                      setSelectedRunner(runner);
+                    }}
+                  >
+                    <View style={styles.runnerRankBadge}><Text style={styles.runnerRankText}>#{index + 1}</Text></View>
+                    <Image source={{ uri: runner.avatar }} style={styles.runnerDirectoryAvatar} />
+                    <View style={styles.runnerDirectoryCopy}>
+                      <Text style={styles.runnerDirectoryName} numberOfLines={1}>{runner.name}</Text>
+                      <Text style={styles.runnerDirectoryMeta} numberOfLines={1}>{runner.totalKm.toLocaleString()} км · 7 хоногт {weeklyRuns} гүйлт</Text>
+                      <View style={styles.runnerDirectoryPills}>
+                        <Text style={styles.runnerDirectoryPill}>Active</Text>
+                        {runner.latestPostTitle ? <Text style={styles.runnerDirectoryPostPill} numberOfLines={1}>{runner.latestPostTitle}</Text> : null}
+                      </View>
+                    </View>
+                    <View style={styles.runnerDirectoryActions}>
+                      <Pressable
+                        style={[styles.runnerDirectoryFollow, followed && styles.runnerDirectoryFollowing]}
+                        onPress={event => {
+                          event.stopPropagation();
+                          onToggleFollow(runner.id);
+                        }}
+                      >
+                        <Text style={styles.runnerDirectoryFollowText}>{followed ? '✓' : '+'}</Text>
+                      </Pressable>
+                      <Pressable
+                        style={styles.runnerDirectoryHide}
+                        onPress={event => {
+                          event.stopPropagation();
+                          onRemoveRunner(runner.id);
+                        }}
+                      >
+                        <Text style={styles.runnerDirectoryHideText}>×</Text>
+                      </Pressable>
+                    </View>
+                  </Pressable>
+                );
+              }) : (
+                <View style={styles.runnerDirectoryEmpty}>
+                  <Text style={styles.runnerDirectoryEmptyTitle}>Илэрц олдсонгүй</Text>
+                  <Text style={styles.runnerDirectoryEmptyText}>Нэрээ өөрөөр бичээд дахин хайна уу.</Text>
+                </View>
+              )}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal transparent visible={Boolean(selectedRunner)} animationType="fade" onRequestClose={() => {
+        setSelectedRunner(null);
+        setSelectedRunnerRun(null);
+      }}>
+        <View style={styles.runnerProfileBackdrop}>
+          <Pressable style={styles.runnerProfileScrim} onPress={() => {
+            setSelectedRunner(null);
+            setSelectedRunnerRun(null);
+          }} />
+          {selectedRunner ? (
+            <View style={styles.runnerProfileCard}>
+              <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.runnerProfileScrollContent}>
+                <ImageBackground source={{ uri: selectedRunner.avatar }} imageStyle={styles.runnerProfileHeroImage} style={styles.runnerProfileHero}>
+                  <LinearGradient colors={['rgba(4,12,16,0.08)', 'rgba(4,12,16,0.9)']} style={styles.runnerProfileHeroShade}>
+                    <Pressable accessibilityLabel="Профайл хаах" style={styles.runnerProfileClose} onPress={() => {
+                      setSelectedRunner(null);
+                      setSelectedRunnerRun(null);
+                    }}>
+                      <Text style={styles.runnerProfileCloseText}>×</Text>
+                    </Pressable>
+                    <View>
+                      <Image source={{ uri: selectedRunner.avatar }} style={styles.runnerProfileAvatar} />
+                      <Text style={styles.runnerProfileName}>{selectedRunner.name}</Text>
+                      <Text style={styles.runnerProfileHandle}>@{selectedRunner.name.toLowerCase().replace(/\s+/g, '.')}</Text>
+                    </View>
+                  </LinearGradient>
+                </ImageBackground>
+
+                <View style={styles.runnerProfileStats}>
+                  <View style={styles.runnerProfileStat}>
+                    <Text style={styles.runnerProfileStatValue}>{selectedRunner.totalKm.toLocaleString()}</Text>
+                    <Text style={styles.runnerProfileStatLabel}>нийт км</Text>
+                  </View>
+                  <View style={styles.runnerProfileDivider} />
+                  <View style={styles.runnerProfileStat}>
+                    <Text style={styles.runnerProfileStatValue}>{Math.max(18, Math.round(selectedRunner.totalKm / 72))}</Text>
+                    <Text style={styles.runnerProfileStatLabel}>гүйлт</Text>
+                  </View>
+                  <View style={styles.runnerProfileDivider} />
+                  <View style={styles.runnerProfileStat}>
+                    <Text style={styles.runnerProfileStatValue}>{selectedRunner.postCount ?? Math.max(12, Math.round(selectedRunner.totalKm / 180))}</Text>
+                    <Text style={styles.runnerProfileStatLabel}>пост</Text>
+                  </View>
+                </View>
+
+                <View style={styles.runnerProfileBio}>
+                  <Text style={styles.runnerProfileSectionTitle}>Товч мэдээлэл</Text>
+                  <Text style={styles.runnerProfileBioText}>
+                    {selectedRunner.latestPostTitle
+                      ? `${selectedRunner.name} нийтэлсэн: “${selectedRunner.latestPostTitle}”. Route, challenge болон сүүлийн идэвхийг эндээс харна.`
+                      : `${selectedRunner.name.split(' ')[0]} тогтвортой бэлтгэл хийдэг гүйгч. Route, challenge болон сүүлийн идэвхийг эндээс харна.`}
+                  </Text>
+                </View>
+
+                <View style={styles.runnerProfileSection}>
+                  <Text style={styles.runnerProfileSectionTitle}>7 хоногийн идэвх</Text>
+                  <View style={styles.runnerProfileWeekRow}>
+                    {selectedRunnerWeeklyRuns.map(run => (
+                      <Pressable
+                        key={run.id}
+                        accessibilityLabel={`${run.label} өдрийн гүйлтийн мэдээлэл`}
+                        hitSlop={6}
+                        style={({ pressed }) => [styles.runnerProfileWeekColumn, pressed && styles.runnerProfileWeekColumnPressed]}
+                        onPress={() => setSelectedRunnerRun(run)}
+                      >
+                        <Text style={styles.runnerProfileWeekDistance}>{run.distanceKm.toFixed(1)}</Text>
+                        <View style={[styles.runnerProfileWeekBar, { height: 24 + (run.distanceKm / selectedRunnerMaxWeeklyKm) * 74 }]} />
+                        <Text style={styles.runnerProfileWeekLabel}>{run.label}</Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                </View>
+
+                <View style={styles.runnerProfileSection}>
+                  <Text style={styles.runnerProfileSectionTitle}>Badge</Text>
+                  <View style={styles.runnerProfileBadgeRow}>
+                    {['5K', '10K', 'STREAK', 'PACE'].map(label => (
+                      <View key={label} style={styles.runnerProfileBadge}>
+                        <Text style={styles.runnerProfileBadgeText}>{label}</Text>
+                      </View>
+                    ))}
+                  </View>
+                </View>
+
+                <View style={styles.runnerProfileSection}>
+                  <Text style={styles.runnerProfileSectionTitle}>Амжилттай оролцсон арга хэмжээнүүд</Text>
+                  <View style={styles.runnerProfileCompletedList}>
+                    {profileCompletedEvents.map(event => (
+                      <View key={event.id} style={styles.runnerProfileCompletedRow}>
+                        <Image source={{ uri: event.image }} style={styles.runnerProfileCompletedImage} />
+                        <View style={styles.runnerProfileCompletedCopy}>
+                          <Text style={styles.runnerProfileCompletedTitle} numberOfLines={1}>{event.title}</Text>
+                          <Text style={styles.runnerProfileCompletedMeta} numberOfLines={1}>{event.clubName} · {event.distanceKm ? `${event.distanceKm} км` : 'Open run'}</Text>
+                        </View>
+                        <View style={styles.runnerProfileCompletedBadge}><Text style={styles.runnerProfileCompletedBadgeText}>✓</Text></View>
+                      </View>
+                    ))}
+                  </View>
+                </View>
+
+                <View style={styles.runnerProfileSection}>
+                  <Text style={styles.runnerProfileSectionTitle}>Дуусгасан challenge-үүд</Text>
+                  <View style={styles.runnerProfileCompletedGrid}>
+                    {profileCompletedChallenges.map(challenge => (
+                      <View key={challenge.id} style={styles.runnerProfileChallengeTile}>
+                        <Image source={{ uri: challenge.image }} style={styles.runnerProfileChallengeImage} />
+                        <Text style={styles.runnerProfileChallengeTitle} numberOfLines={2}>{challenge.title}</Text>
+                        <Text style={styles.runnerProfileChallengeMeta}>{challenge.goalKm} км · Completed</Text>
+                      </View>
+                    ))}
+                  </View>
+                </View>
+
+                <View style={styles.runnerProfileSection}>
+                  <Text style={styles.runnerProfileSectionTitle}>Марафоны амжилт</Text>
+                  <View style={styles.runnerProfileCompletedList}>
+                    {profileCompletedMarathons.map(challenge => (
+                      <View key={challenge.id} style={styles.runnerProfileMarathonRow}>
+                        <View style={styles.runnerProfileMedal}><Text style={styles.runnerProfileMedalText}>42K</Text></View>
+                        <View style={styles.runnerProfileCompletedCopy}>
+                          <Text style={styles.runnerProfileCompletedTitle} numberOfLines={1}>{challenge.title}</Text>
+                          <Text style={styles.runnerProfileCompletedMeta} numberOfLines={1}>{challenge.org} · finisher</Text>
+                        </View>
+                        <Text style={styles.runnerProfileMarathonStatus}>FINISH</Text>
+                      </View>
+                    ))}
+                  </View>
+                </View>
+
+                {selectedRunner.latestPostTitle ? (
+                  <View style={styles.runnerProfileSection}>
+                    <Text style={styles.runnerProfileSectionTitle}>Сүүлийн нийтлэл</Text>
+                    <View style={styles.runnerProfileLatestPost}>
+                      <Text style={styles.runnerProfileLatestPostTitle}>{selectedRunner.latestPostTitle}</Text>
+                      <Text style={styles.runnerProfileLatestPostMeta}>{selectedRunner.name} · RUNBOOST feed</Text>
+                    </View>
+                  </View>
+                ) : null}
+
+                <View style={styles.runnerProfileActions}>
+                  <Pressable
+                    style={[styles.runnerProfileFollowButton, followedRunnerIds.includes(selectedRunner.id) && styles.runnerProfileFollowingButton]}
+                    onPress={() => onToggleFollow(selectedRunner.id)}
+                  >
+                    <Text style={styles.runnerProfileFollowText}>{followedRunnerIds.includes(selectedRunner.id) ? '✓ Найз' : '＋ Дагах'}</Text>
+                  </Pressable>
+                  <Pressable
+                    style={styles.runnerProfileRemoveButton}
+                    onPress={() => {
+                      onRemoveRunner(selectedRunner.id);
+                      setSelectedRunner(null);
+                      setSelectedRunnerRun(null);
+                    }}
+                  >
+                    <Text style={styles.runnerProfileRemoveText}>Нуух</Text>
+                  </Pressable>
+                </View>
+              </ScrollView>
+            </View>
+          ) : null}
+        </View>
+      </Modal>
+
+      <Modal transparent visible={Boolean(selectedRunnerRun)} animationType="fade" onRequestClose={() => setSelectedRunnerRun(null)}>
+        <View style={styles.runnerRunDetailBackdrop}>
+          <Pressable style={styles.runnerRunDetailScrim} onPress={() => setSelectedRunnerRun(null)} />
+          {selectedRunnerRun ? (
+            <View style={styles.runnerRunDetailCard}>
+              <ImageBackground source={{ uri: selectedRunnerRun.image }} imageStyle={styles.runnerRunDetailImage} style={styles.runnerRunDetailHero}>
+                <LinearGradient colors={['rgba(4,12,16,0.08)', 'rgba(4,12,16,0.92)']} style={styles.runnerRunDetailHeroShade}>
+                  <Pressable accessibilityLabel="Гүйлтийн мэдээлэл хаах" style={styles.runnerRunDetailClose} onPress={() => setSelectedRunnerRun(null)}>
+                    <Text style={styles.runnerRunDetailCloseText}>×</Text>
+                  </Pressable>
+                  <Text style={styles.runnerRunDetailEyebrow}>ТУХАЙН ӨДРИЙН ГҮЙЛТ</Text>
+                  <Text style={styles.runnerRunDetailTitle}>{selectedRunnerRun.routeTitle}</Text>
+                  <Text style={styles.runnerRunDetailMeta}>{selectedRunnerRun.dateLabel} · {selectedRunnerRun.completedAt}</Text>
+                </LinearGradient>
+              </ImageBackground>
+
+              <View style={styles.runnerRunDetailStats}>
+                <View style={styles.runnerRunDetailStat}>
+                  <Text style={styles.runnerRunDetailValue}>{selectedRunnerRun.distanceKm.toFixed(1)}</Text>
+                  <Text style={styles.runnerRunDetailLabel}>км</Text>
+                </View>
+                <View style={styles.runnerRunDetailStat}>
+                  <Text style={styles.runnerRunDetailValue}>{selectedRunnerRun.duration}</Text>
+                  <Text style={styles.runnerRunDetailLabel}>хугацаа</Text>
+                </View>
+                <View style={styles.runnerRunDetailStat}>
+                  <Text style={styles.runnerRunDetailValue}>{selectedRunnerRun.pace}</Text>
+                  <Text style={styles.runnerRunDetailLabel}>темп</Text>
+                </View>
+              </View>
+
+              <View style={styles.runnerRunDetailFooter}>
+                <Text style={styles.runnerRunDetailRouteArea}>{selectedRunnerRun.routeArea}</Text>
+                <Text style={styles.runnerRunDetailCalories}>{selectedRunnerRun.calories} ккал · {selectedRunner?.name ?? 'Гүйгч'}</Text>
+              </View>
             </View>
           ) : null}
         </View>
@@ -1153,41 +1738,58 @@ const styles = StyleSheet.create({
   brandMark: { width: 34, height: 34, borderRadius: 17, color: '#ffffff', backgroundColor: 'rgba(255,255,255,0.12)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.32)', overflow: 'hidden', textAlign: 'center', lineHeight: 33, fontSize: 19, fontWeight: '900' },
   brand: { color: colors.text, fontSize: 20, fontWeight: '900' },
   brandSub: { color: '#D5E1E7', fontSize: 10, fontWeight: '800', marginTop: 1 },
-  weatherCard: { borderRadius: 22, minHeight: 242, marginBottom: 16, backgroundColor: 'rgba(9,28,32,0.7)', borderWidth: 1, borderColor: 'rgba(224,246,250,0.36)', shadowColor: '#02090c', shadowOpacity: 0.42, shadowRadius: 28, shadowOffset: { width: 0, height: 14 }, overflow: 'hidden' },
-  weatherContent: { position: 'relative', zIndex: 2, padding: 18 },
-  weatherMotionLayer: { ...StyleSheet.absoluteFillObject, opacity: 0.1 },
+  weatherCard: { borderRadius: 22, minHeight: 164, marginBottom: 16, backgroundColor: 'rgba(43,48,58,0.76)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.22)', shadowColor: '#02090c', shadowOpacity: 0.42, shadowRadius: 28, shadowOffset: { width: 0, height: 14 }, overflow: 'hidden' },
+  weatherContent: { position: 'relative', zIndex: 2, paddingHorizontal: 18, paddingTop: 16, paddingBottom: 13 },
+  weatherMotionLayer: { ...StyleSheet.absoluteFillObject, opacity: 1 },
   weatherSkyGradient: { ...StyleSheet.absoluteFillObject },
-  sunGlow: { position: 'absolute', right: 18, top: 18, width: 112, height: 112, borderRadius: 56, backgroundColor: 'rgba(56,189,248,0.24)', shadowColor: '#7DD3FC', shadowOpacity: 0.5, shadowRadius: 28 },
-  weatherLightBand: { position: 'absolute', left: -70, top: 18, width: 190, height: 46, borderRadius: 23, backgroundColor: 'rgba(125,211,252,0.14)' },
-  cloudBand: { position: 'absolute', height: 48, borderRadius: 24, backgroundColor: 'rgba(148,163,184,0.18)' },
-  cloudBandOne: { left: -32, top: 28, width: 172 },
-  cloudBandTwo: { right: -42, top: 86, width: 210, backgroundColor: 'rgba(203,213,225,0.12)' },
+  weatherAtmosphere: { ...StyleSheet.absoluteFillObject },
+  weatherHorizon: { position: 'absolute', left: -20, right: -20, bottom: -42, height: 82, borderTopLeftRadius: 120, borderTopRightRadius: 120, backgroundColor: 'rgba(255,255,255,0.05)' },
+  weatherReadabilityShade: { ...StyleSheet.absoluteFillObject },
+  sunGlow: { position: 'absolute', right: 18, top: 2, width: 116, height: 116, borderRadius: 58, backgroundColor: 'rgba(251,191,36,0.14)', shadowColor: '#FDE68A', shadowOpacity: 0.55, shadowRadius: 30 },
+  sunDisc: { position: 'absolute', right: 42, top: 30, width: 44, height: 44, borderRadius: 22, backgroundColor: 'rgba(254,240,138,0.82)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.48)' },
+  weatherLightBand: { position: 'absolute', left: -70, top: 12, width: 230, height: 58, borderRadius: 29, backgroundColor: 'rgba(226,232,240,0.12)' },
+  cloudBand: { position: 'absolute', height: 58, borderRadius: 29, backgroundColor: 'rgba(203,213,225,0.18)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.08)' },
+  cloudBandOne: { left: -42, top: 20, width: 210 },
+  cloudBandTwo: { right: -58, top: 72, width: 250, backgroundColor: 'rgba(148,163,184,0.18)' },
+  cloudBandThree: { left: 72, top: 118, width: 220, height: 46, backgroundColor: 'rgba(226,232,240,0.1)' },
   precipitationLayer: { ...StyleSheet.absoluteFillObject },
-  rainStreak: { position: 'absolute', width: 2, height: 54, borderRadius: 1, backgroundColor: 'rgba(125,211,252,0.5)' },
-  snowDot: { position: 'absolute', width: 7, height: 7, borderRadius: 4, backgroundColor: 'rgba(240,249,255,0.72)' },
-  stormFlash: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(255,255,255,0.32)' },
+  rainStreak: { position: 'absolute', width: 2, height: 62, borderRadius: 1, backgroundColor: 'rgba(186,230,253,0.72)' },
+  snowDot: { position: 'absolute', width: 8, height: 8, borderRadius: 4, backgroundColor: 'rgba(240,249,255,0.82)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.34)' },
+  stormFlash: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(255,255,255,0.38)' },
   weatherHeaderRow: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between' },
-  weatherLocation: { color: '#ffffff', fontSize: 10, fontWeight: '900' },
+  weatherLocation: { color: 'rgba(255,255,255,0.78)', fontSize: 9, fontWeight: '800' },
   weatherSymbol: { color: 'rgba(255,255,255,0.76)', fontSize: 28, fontWeight: '300', lineHeight: 30 },
-  weatherHeroRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginTop: 10 },
+  weatherHeroRow: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 },
   weatherMain: { flex: 1, minWidth: 0 },
-  weatherDate: { color: '#D2E0E6', fontSize: 10, fontWeight: '700', marginTop: 3 },
+  weatherDate: { color: 'rgba(255,255,255,0.62)', fontSize: 9, fontWeight: '700', marginTop: 3 },
+  weatherSceneIcon: { width: 118, height: 82, position: 'relative', marginRight: 2, marginTop: 2 },
+  iconSun: { position: 'absolute', right: 18, top: 2, width: 40, height: 40, borderRadius: 20, backgroundColor: '#F8D84D', shadowColor: '#F8D84D', shadowOpacity: 0.42, shadowRadius: 14 },
+  sunRay: { position: 'absolute', width: 5, height: 14, borderRadius: 3, backgroundColor: '#F8D84D' },
+  sunRayTop: { right: 36, top: -8 },
+  sunRayRight: { right: 0, top: 25, transform: [{ rotate: '90deg' }] },
+  sunRayAngle: { right: 7, top: 3, transform: [{ rotate: '45deg' }] },
+  iconCloudMain: { position: 'absolute', left: 14, bottom: 9, width: 80, height: 38, borderRadius: 19, backgroundColor: 'rgba(226,232,240,0.96)', shadowColor: '#FFFFFF', shadowOpacity: 0.18, shadowRadius: 10 },
+  iconCloudLeft: { position: 'absolute', left: 8, bottom: 14, width: 44, height: 44, borderRadius: 22, backgroundColor: 'rgba(203,213,225,0.98)' },
+  iconCloudTop: { position: 'absolute', left: 39, bottom: 25, width: 47, height: 47, borderRadius: 24, backgroundColor: 'rgba(241,245,249,0.98)' },
+  iconRainWrap: { position: 'absolute', left: 30, bottom: -2, width: 50, height: 18 },
+  iconRainDrop: { position: 'absolute', top: 0, width: 2, height: 18, borderRadius: 1, backgroundColor: 'rgba(186,230,253,0.92)', transform: [{ rotate: '14deg' }] },
+  iconSnow: { position: 'absolute', left: 47, bottom: -3, color: 'rgba(240,249,255,0.96)', fontSize: 20, fontWeight: '900' },
   temperatureRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
-  weatherTemp: { color: colors.text, fontSize: 48, fontWeight: '800', lineHeight: 54 },
-  weatherCondition: { color: '#ffffff', fontSize: 13, fontWeight: '800', marginBottom: 6 },
-  runReadyBadge: { alignSelf: 'flex-start', height: 22, borderRadius: 11, flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: 'rgba(215,255,192,0.14)', borderWidth: 1, borderColor: 'rgba(215,255,192,0.26)', paddingHorizontal: 8 },
+  weatherTemp: { color: '#FFFFFF', fontSize: 52, fontWeight: '600', lineHeight: 58 },
+  weatherCondition: { color: 'rgba(255,255,255,0.74)', fontSize: 18, fontWeight: '500', marginTop: -2 },
+  runReadyBadge: { alignSelf: 'flex-start', height: 22, borderRadius: 11, flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: 'rgba(255,255,255,0.12)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.18)', paddingHorizontal: 8, marginTop: 8 },
   runReadyDot: { width: 5, height: 5, borderRadius: 3, backgroundColor: '#cfffad' },
-  runReadyText: { color: '#dfffc7', fontSize: 7, fontWeight: '900' },
+  runReadyText: { color: 'rgba(238,255,226,0.92)', fontSize: 7, fontWeight: '900' },
   aqiBadge: { width: 78, height: 78, borderRadius: 22, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(218,255,200,0.86)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.76)', shadowColor: '#d8ffc0', shadowOpacity: 0.2, shadowRadius: 14 },
   aqiLabel: { color: 'rgba(23,37,29,0.62)', fontSize: 7, fontWeight: '900' },
   aqiValue: { color: '#17251d', fontSize: 24, fontWeight: '900', lineHeight: 28 },
   aqiText: { color: '#314d3a', fontSize: 8, fontWeight: '800' },
-  weatherMiniRow: { height: 50, borderRadius: 16, flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.08)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.13)', marginTop: 13 },
-  weatherMiniStat: { flex: 1, alignItems: 'center' },
-  weatherMiniDivider: { width: 1, height: 24, backgroundColor: 'rgba(255,255,255,0.16)' },
-  weatherMiniLabel: { color: '#C4D2D9', fontSize: 7, fontWeight: '900' },
-  weatherMiniValue: { color: colors.text, fontSize: 13, fontWeight: '900', marginTop: 3 },
-  weatherNoteRow: { minHeight: 40, borderRadius: 14, flexDirection: 'row', alignItems: 'center', gap: 9, backgroundColor: 'rgba(8,16,22,0.2)', paddingHorizontal: 10, paddingVertical: 7, marginTop: 9 },
+  weatherMiniRow: { height: 44, flexDirection: 'row', alignItems: 'flex-end', borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.08)', marginTop: 8, paddingTop: 9 },
+  weatherMiniStat: { flex: 1, alignItems: 'flex-start' },
+  weatherMiniDivider: { width: 1, height: 30, backgroundColor: 'rgba(255,255,255,0.08)', marginHorizontal: 8 },
+  weatherMiniLabel: { color: 'rgba(255,255,255,0.42)', fontSize: 9, fontWeight: '600' },
+  weatherMiniValue: { color: 'rgba(255,255,255,0.86)', fontSize: 14, fontWeight: '600', marginTop: 3 },
+  weatherNoteRow: { minHeight: 40, borderRadius: 14, flexDirection: 'row', alignItems: 'center', gap: 9, backgroundColor: 'rgba(8,16,22,0.34)', paddingHorizontal: 10, paddingVertical: 7, marginTop: 9 },
   weatherNoteIcon: { width: 20, height: 20, borderRadius: 10, backgroundColor: 'rgba(255,255,255,0.12)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.2)', alignItems: 'center', justifyContent: 'center' },
   weatherNoteIconText: { color: 'rgba(255,255,255,0.76)', fontSize: 10, fontWeight: '900' },
   weatherNote: { flex: 1, color: '#D7E3E8', fontSize: 9, fontWeight: '700', lineHeight: 13 },
@@ -1249,6 +1851,8 @@ const styles = StyleSheet.create({
   discoveryShade: { flex: 1, justifyContent: 'space-between', padding: 13, backgroundColor: 'rgba(12,20,26,0.36)' },
   difficultyPill: { alignSelf: 'flex-start', borderRadius: 999, paddingHorizontal: 10, paddingVertical: 6, backgroundColor: 'rgba(57,255,136,0.9)' },
   difficultyText: { color: colors.bg, fontSize: 10, fontWeight: '900' },
+  marathonMedalBadge: { width: 46, height: 46, alignItems: 'center', justifyContent: 'center', borderRadius: 15, backgroundColor: 'rgba(4,13,17,0.54)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.24)' },
+  marathonMedalImage: { width: 38, height: 38 },
   discoveryTitle: { color: colors.text, fontSize: 16, fontWeight: '900' },
   discoveryMeta: { color: 'rgba(248,250,252,0.76)', fontSize: 11, fontWeight: '800', marginTop: 4 },
   challengeRow: { gap: 10, paddingBottom: 13 },
@@ -1286,6 +1890,8 @@ const styles = StyleSheet.create({
   sectionHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 18, marginBottom: 10 },
   sectionTitle: { color: '#FFFFFF', fontSize: 17, fontWeight: '900' },
   sectionSubtitle: { color: '#C6D4DB', fontSize: 10, fontWeight: '800', marginTop: 3 },
+  sectionLinkButton: { minHeight: 30, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 4 },
+  sectionLinkPressed: { opacity: 0.7 },
   sectionLink: { color: colors.accent, fontSize: 11, fontWeight: '900' },
   achievementFilterRow: { gap: 8, paddingBottom: 10 },
   achievementFilter: { height: 34, borderRadius: 17, paddingHorizontal: 13, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(9,27,32,0.78)', borderWidth: 1, borderColor: 'rgba(220,244,248,0.28)' },
@@ -1294,6 +1900,7 @@ const styles = StyleSheet.create({
   activeAchievementFilterText: { color: colors.accent },
   runnerRow: { gap: 10, paddingBottom: 13 },
   runnerCard: { width: 150, backgroundColor: 'rgba(9,27,32,0.82)', borderRadius: 16, borderWidth: 1, borderColor: 'rgba(220,244,248,0.28)', padding: 12, alignItems: 'center', shadowColor: '#02090c', shadowOpacity: 0.34, shadowRadius: 18, shadowOffset: { width: 0, height: 9 } },
+  runnerCardPressed: { opacity: 0.78, transform: [{ scale: 0.98 }] },
   runnerAvatar: { width: 52, height: 52, borderRadius: 17, borderWidth: 2, borderColor: colors.primary, overflow: 'hidden' },
   runnerImageWrap: { flex: 1 },
   runnerImage: { borderRadius: 13 },
@@ -1305,6 +1912,114 @@ const styles = StyleSheet.create({
   followText: { color: colors.bg, fontSize: 9, fontWeight: '900' },
   removeButton: { minWidth: 57, borderRadius: 999, alignItems: 'center', paddingVertical: 6, borderWidth: 1, borderColor: colors.line },
   removeText: { color: '#D4E0E5', fontSize: 9, fontWeight: '900' },
+  runnerDirectoryBackdrop: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,7,10,0.7)' },
+  runnerDirectoryScrim: { ...StyleSheet.absoluteFillObject },
+  runnerDirectorySheet: { width: '100%', maxHeight: '88%', borderTopLeftRadius: 26, borderTopRightRadius: 26, paddingTop: 18, backgroundColor: '#071A20', borderWidth: 1, borderColor: 'rgba(220,244,248,0.22)', overflow: 'hidden' },
+  runnerDirectoryHeader: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: 14, paddingHorizontal: 18, paddingBottom: 14 },
+  runnerDirectoryEyebrow: { color: colors.accent, fontSize: 9, fontWeight: '900' },
+  runnerDirectoryTitle: { color: '#FFFFFF', fontSize: 21, fontWeight: '900', marginTop: 4 },
+  runnerDirectorySubtitle: { color: '#9FB2B9', fontSize: 11, fontWeight: '800', marginTop: 5 },
+  runnerDirectoryClose: { width: 38, height: 38, borderRadius: 19, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.08)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.18)' },
+  runnerDirectoryCloseText: { color: '#D7E4E9', fontSize: 25, lineHeight: 27, fontWeight: '700' },
+  runnerSearchBox: { height: 46, flexDirection: 'row', alignItems: 'center', gap: 9, marginHorizontal: 18, marginBottom: 12, borderRadius: 15, paddingHorizontal: 13, backgroundColor: 'rgba(255,255,255,0.08)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.16)' },
+  runnerSearchIcon: { color: colors.accent, fontSize: 18, fontWeight: '900' },
+  runnerSearchInput: { flex: 1, height: 44, color: '#FFFFFF', fontSize: 13, fontWeight: '800', padding: 0 },
+  runnerSearchClear: { color: '#D7E4E9', fontSize: 20, lineHeight: 22, fontWeight: '800' },
+  runnerDirectoryList: { gap: 10, paddingHorizontal: 18, paddingBottom: 24 },
+  runnerDirectoryRow: { minHeight: 86, flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 18, padding: 10, backgroundColor: 'rgba(255,255,255,0.065)', borderWidth: 1, borderColor: 'rgba(220,244,248,0.16)' },
+  runnerDirectoryRowPressed: { opacity: 0.78, transform: [{ scale: 0.992 }] },
+  runnerRankBadge: { width: 34, height: 34, borderRadius: 12, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(182,255,46,0.12)', borderWidth: 1, borderColor: 'rgba(182,255,46,0.28)' },
+  runnerRankText: { color: colors.accent, fontSize: 10, fontWeight: '900' },
+  runnerDirectoryAvatar: { width: 54, height: 54, borderRadius: 18, backgroundColor: '#10262D', borderWidth: 2, borderColor: 'rgba(57,255,136,0.55)' },
+  runnerDirectoryCopy: { flex: 1, minWidth: 0 },
+  runnerDirectoryName: { color: '#FFFFFF', fontSize: 14, fontWeight: '900' },
+  runnerDirectoryMeta: { color: '#AFC1C8', fontSize: 10, fontWeight: '800', marginTop: 4 },
+  runnerDirectoryPills: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 8 },
+  runnerDirectoryPill: { color: '#071A20', fontSize: 8, fontWeight: '900', borderRadius: 999, overflow: 'hidden', paddingHorizontal: 8, paddingVertical: 4, backgroundColor: colors.accent },
+  runnerDirectoryPostPill: { flexShrink: 1, color: '#D7E4E9', fontSize: 8, fontWeight: '900', borderRadius: 999, overflow: 'hidden', paddingHorizontal: 8, paddingVertical: 4, backgroundColor: 'rgba(255,255,255,0.09)' },
+  runnerDirectoryActions: { alignItems: 'center', gap: 7 },
+  runnerDirectoryFollow: { width: 32, height: 32, borderRadius: 16, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.primary },
+  runnerDirectoryFollowing: { backgroundColor: colors.secondary },
+  runnerDirectoryFollowText: { color: '#071A20', fontSize: 16, fontWeight: '900' },
+  runnerDirectoryHide: { width: 32, height: 32, borderRadius: 16, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.06)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.16)' },
+  runnerDirectoryHideText: { color: '#D7E4E9', fontSize: 18, lineHeight: 20, fontWeight: '800' },
+  runnerDirectoryEmpty: { minHeight: 180, alignItems: 'center', justifyContent: 'center', borderRadius: 18, backgroundColor: 'rgba(255,255,255,0.05)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)' },
+  runnerDirectoryEmptyTitle: { color: '#FFFFFF', fontSize: 15, fontWeight: '900' },
+  runnerDirectoryEmptyText: { color: '#9FB2B9', fontSize: 11, fontWeight: '800', marginTop: 6 },
+  runnerProfileBackdrop: { flex: 1, alignItems: 'center', justifyContent: 'flex-end', paddingTop: 38, backgroundColor: 'rgba(0,7,10,0.7)' },
+  runnerProfileScrim: { ...StyleSheet.absoluteFillObject },
+  runnerProfileCard: { width: '100%', maxHeight: '94%', borderTopLeftRadius: 26, borderTopRightRadius: 26, overflow: 'hidden', backgroundColor: '#091b20', borderWidth: 1, borderColor: 'rgba(220,244,248,0.24)', shadowColor: '#000', shadowOpacity: 0.38, shadowRadius: 28, shadowOffset: { width: 0, height: 16 } },
+  runnerProfileScrollContent: { paddingBottom: 30 },
+  runnerProfileHero: { height: 286, backgroundColor: '#10262D' },
+  runnerProfileHeroImage: { opacity: 0.56 },
+  runnerProfileHeroShade: { flex: 1, justifyContent: 'flex-end', alignItems: 'center', paddingHorizontal: 20, paddingBottom: 22 },
+  runnerProfileClose: { position: 'absolute', right: 14, top: 14, width: 38, height: 38, alignItems: 'center', justifyContent: 'center', borderRadius: 19, backgroundColor: 'rgba(4,13,17,0.7)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.24)' },
+  runnerProfileCloseText: { color: '#D7E4E9', fontSize: 25, lineHeight: 27, fontWeight: '700' },
+  runnerProfileAvatar: { alignSelf: 'center', width: 112, height: 112, borderRadius: 56, borderWidth: 3, borderColor: colors.accent, backgroundColor: '#10262D' },
+  runnerProfileName: { color: '#FFFFFF', fontSize: 22, fontWeight: '900', marginTop: 14, textAlign: 'center' },
+  runnerProfileHandle: { color: '#D5E3E8', fontSize: 11, fontWeight: '800', marginTop: 4, textAlign: 'center' },
+  runnerProfileStats: { minHeight: 82, flexDirection: 'row', alignItems: 'center', marginHorizontal: 16, marginTop: 16, borderRadius: 18, backgroundColor: 'rgba(255,255,255,0.07)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.14)' },
+  runnerProfileStat: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 6 },
+  runnerProfileStatValue: { color: '#FFFFFF', fontSize: 16, fontWeight: '900', textAlign: 'center' },
+  runnerProfileStatLabel: { color: '#9FB2B9', fontSize: 8, fontWeight: '800', textAlign: 'center', marginTop: 4 },
+  runnerProfileDivider: { width: 1, height: 32, backgroundColor: 'rgba(255,255,255,0.14)' },
+  runnerProfileBio: { borderRadius: 16, padding: 13, marginHorizontal: 16, marginTop: 14, backgroundColor: 'rgba(255,255,255,0.06)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)' },
+  runnerProfileBioText: { color: '#D5E2E6', fontSize: 11, lineHeight: 17, fontWeight: '800', marginTop: 7 },
+  runnerProfileSection: { marginHorizontal: 16, marginTop: 16 },
+  runnerProfileSectionTitle: { color: '#FFFFFF', fontSize: 14, fontWeight: '900' },
+  runnerProfileWeekRow: { height: 138, flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'space-between', borderRadius: 16, paddingHorizontal: 12, paddingTop: 14, paddingBottom: 10, marginTop: 10, backgroundColor: 'rgba(255,255,255,0.06)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)' },
+  runnerProfileWeekColumn: { width: 34, alignItems: 'center', justifyContent: 'flex-end' },
+  runnerProfileWeekColumnPressed: { opacity: 0.72, transform: [{ scale: 0.96 }] },
+  runnerProfileWeekDistance: { height: 16, color: '#D7E4E9', fontSize: 8, fontWeight: '900', marginBottom: 4 },
+  runnerProfileWeekBar: { width: 12, borderRadius: 6, backgroundColor: colors.accent },
+  runnerProfileWeekLabel: { color: '#AFC1C8', fontSize: 9, fontWeight: '800', marginTop: 7 },
+  runnerProfileBadgeRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 10 },
+  runnerProfileBadge: { minHeight: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 12, backgroundColor: 'rgba(182,255,46,0.12)', borderWidth: 1, borderColor: 'rgba(182,255,46,0.3)' },
+  runnerProfileBadgeText: { color: colors.accent, fontSize: 10, fontWeight: '900' },
+  runnerProfileCompletedList: { gap: 9, marginTop: 10 },
+  runnerProfileCompletedRow: { minHeight: 70, flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 16, padding: 9, backgroundColor: 'rgba(255,255,255,0.06)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)' },
+  runnerProfileCompletedImage: { width: 52, height: 52, borderRadius: 12, backgroundColor: '#10262D' },
+  runnerProfileCompletedCopy: { flex: 1, minWidth: 0 },
+  runnerProfileCompletedTitle: { color: '#FFFFFF', fontSize: 12, fontWeight: '900' },
+  runnerProfileCompletedMeta: { color: '#9FB2B9', fontSize: 9, fontWeight: '800', marginTop: 4 },
+  runnerProfileCompletedBadge: { width: 28, height: 28, borderRadius: 14, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(182,255,46,0.16)', borderWidth: 1, borderColor: 'rgba(182,255,46,0.38)' },
+  runnerProfileCompletedBadgeText: { color: colors.accent, fontSize: 14, fontWeight: '900' },
+  runnerProfileCompletedGrid: { flexDirection: 'row', gap: 9, marginTop: 10 },
+  runnerProfileChallengeTile: { flex: 1, minHeight: 144, borderRadius: 16, padding: 9, backgroundColor: 'rgba(255,255,255,0.06)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)' },
+  runnerProfileChallengeImage: { width: '100%', height: 70, borderRadius: 11, backgroundColor: '#10262D' },
+  runnerProfileChallengeTitle: { color: '#FFFFFF', fontSize: 11, lineHeight: 15, fontWeight: '900', marginTop: 8, minHeight: 30 },
+  runnerProfileChallengeMeta: { color: colors.accent, fontSize: 8, fontWeight: '900', marginTop: 5 },
+  runnerProfileMarathonRow: { minHeight: 72, flexDirection: 'row', alignItems: 'center', gap: 10, borderRadius: 16, padding: 10, backgroundColor: 'rgba(182,255,46,0.08)', borderWidth: 1, borderColor: 'rgba(182,255,46,0.24)' },
+  runnerProfileMedal: { width: 52, height: 52, borderRadius: 18, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.1)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.18)' },
+  runnerProfileMedalText: { color: colors.accent, fontSize: 13, fontWeight: '900' },
+  runnerProfileMarathonStatus: { color: colors.accent, fontSize: 8, fontWeight: '900', borderRadius: 999, paddingHorizontal: 8, paddingVertical: 5, overflow: 'hidden', backgroundColor: 'rgba(182,255,46,0.12)' },
+  runnerProfileLatestPost: { borderRadius: 16, padding: 13, marginTop: 10, backgroundColor: 'rgba(255,255,255,0.06)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)' },
+  runnerProfileLatestPostTitle: { color: '#FFFFFF', fontSize: 13, fontWeight: '900' },
+  runnerProfileLatestPostMeta: { color: '#9FB2B9', fontSize: 10, fontWeight: '800', marginTop: 6 },
+  runnerProfileActions: { flexDirection: 'row', gap: 10, marginHorizontal: 16, marginTop: 18 },
+  runnerProfileFollowButton: { flex: 1, height: 46, borderRadius: 15, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.accent },
+  runnerProfileFollowingButton: { backgroundColor: colors.secondary },
+  runnerProfileFollowText: { color: '#102014', fontSize: 12, fontWeight: '900' },
+  runnerProfileRemoveButton: { width: 92, height: 46, borderRadius: 15, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: 'rgba(220,244,248,0.28)', backgroundColor: 'rgba(255,255,255,0.06)' },
+  runnerProfileRemoveText: { color: '#D9E7EB', fontSize: 12, fontWeight: '900' },
+  runnerRunDetailBackdrop: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 18, backgroundColor: 'rgba(0,7,10,0.62)' },
+  runnerRunDetailScrim: { ...StyleSheet.absoluteFillObject },
+  runnerRunDetailCard: { width: '100%', maxWidth: 420, overflow: 'hidden', borderRadius: 24, backgroundColor: '#091b20', borderWidth: 1, borderColor: 'rgba(220,244,248,0.22)', shadowColor: '#000', shadowOpacity: 0.38, shadowRadius: 26, shadowOffset: { width: 0, height: 14 } },
+  runnerRunDetailHero: { height: 170, backgroundColor: '#10262D' },
+  runnerRunDetailImage: { opacity: 0.62 },
+  runnerRunDetailHeroShade: { flex: 1, justifyContent: 'flex-end', padding: 16 },
+  runnerRunDetailClose: { position: 'absolute', top: 12, right: 12, width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(4,13,17,0.72)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.22)' },
+  runnerRunDetailCloseText: { color: '#D7E4E9', fontSize: 22, lineHeight: 24, fontWeight: '800' },
+  runnerRunDetailEyebrow: { color: colors.accent, fontSize: 8, fontWeight: '900' },
+  runnerRunDetailTitle: { color: '#FFFFFF', fontSize: 20, lineHeight: 25, fontWeight: '900', marginTop: 5 },
+  runnerRunDetailMeta: { color: '#C6D4DA', fontSize: 10, fontWeight: '800', marginTop: 5 },
+  runnerRunDetailStats: { flexDirection: 'row', gap: 8, paddingHorizontal: 12, paddingTop: 12 },
+  runnerRunDetailStat: { flex: 1, minHeight: 70, justifyContent: 'center', borderRadius: 16, paddingHorizontal: 10, backgroundColor: 'rgba(255,255,255,0.07)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.12)' },
+  runnerRunDetailValue: { color: '#FFFFFF', fontSize: 14, fontWeight: '900' },
+  runnerRunDetailLabel: { color: '#9FB2B9', fontSize: 8, fontWeight: '900', marginTop: 5 },
+  runnerRunDetailFooter: { padding: 14, gap: 5 },
+  runnerRunDetailRouteArea: { color: '#FFFFFF', fontSize: 13, fontWeight: '900' },
+  runnerRunDetailCalories: { color: '#9FB2B9', fontSize: 10, fontWeight: '800' },
   clubModalRoot: { flex: 1, justifyContent: 'flex-end' },
   clubModalBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,7,10,0.72)' },
   clubSheet: { maxHeight: '90%', borderTopLeftRadius: 24, borderTopRightRadius: 24, overflow: 'hidden', backgroundColor: '#091b20', borderWidth: 1, borderColor: 'rgba(221,247,249,0.28)' },
@@ -1324,6 +2039,14 @@ const styles = StyleSheet.create({
   clubSheetStatLabel: { color: '#BFD0D6', fontSize: 8, fontWeight: '800', marginTop: 4 },
   clubSheetDivider: { width: 1, height: 34, backgroundColor: 'rgba(255,255,255,0.16)' },
   clubDescription: { color: '#D5E2E6', fontSize: 12, lineHeight: 18, fontWeight: '700', marginHorizontal: 18, marginTop: 18 },
+  clubModalContactSection: { marginHorizontal: 17, marginTop: 18 },
+  clubModalSectionTitle: { color: '#FFFFFF', fontSize: 14, fontWeight: '900', marginBottom: 9 },
+  clubModalContact: { color: '#EAF5F7', fontSize: 11, lineHeight: 16, fontWeight: '800', borderRadius: 13, paddingHorizontal: 12, paddingVertical: 10, backgroundColor: 'rgba(255,255,255,0.08)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.14)' },
+  clubModalSocialRow: { flexDirection: 'row', gap: 10, marginTop: 10 },
+  clubModalSocialButton: { width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: 'rgba(255,255,255,0.32)' },
+  clubModalSocialButtonDisabled: { opacity: 0.82 },
+  clubModalSocialIcon: { fontSize: 15, fontWeight: '900' },
+  clubModalSocialWebIcon: { fontSize: 9, letterSpacing: 0 },
   clubGallerySection: { marginTop: 20 },
   clubGalleryHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginHorizontal: 17, marginBottom: 10 },
   clubGalleryTitle: { color: '#FFFFFF', fontSize: 14, fontWeight: '900' },
@@ -1333,21 +2056,29 @@ const styles = StyleSheet.create({
   clubGalleryImage: { borderRadius: 12 },
   clubGalleryZoom: { width: 28, height: 28, borderRadius: 14, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(4,13,17,0.74)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.4)' },
   clubGalleryZoomText: { color: '#FFFFFF', fontSize: 14, fontWeight: '900' },
-  clubModalEvents: { marginHorizontal: 17, marginTop: 20 },
-  clubModalEventsTitle: { color: '#FFFFFF', fontSize: 14, fontWeight: '900', marginBottom: 9 },
-  clubModalEventRow: { minHeight: 56, flexDirection: 'row', alignItems: 'center', gap: 11, borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.12)', paddingVertical: 10 },
-  clubModalEventDate: { width: 72 },
+  clubModalEvents: { marginTop: 20 },
+  clubModalEventsHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginHorizontal: 17, marginBottom: 9 },
+  clubModalEventsTitle: { color: '#FFFFFF', fontSize: 14, fontWeight: '900' },
+  clubModalEventsCount: { color: colors.accent, fontSize: 9, fontWeight: '900' },
+  clubModalEventRow: { gap: 10, paddingHorizontal: 17, paddingRight: 24 },
+  clubModalEventCard: { width: 154, minHeight: 150, overflow: 'hidden', borderRadius: 15, backgroundColor: 'rgba(255,255,255,0.07)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.14)' },
+  clubModalEventImageWrap: { height: 80, alignItems: 'flex-start', justifyContent: 'flex-start', padding: 8 },
+  clubModalEventImage: { borderTopLeftRadius: 14, borderTopRightRadius: 14 },
+  clubModalEventDate: { minHeight: 26, borderRadius: 8, paddingHorizontal: 8, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(5,17,21,0.82)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.32)' },
   clubModalEventDateText: { color: colors.accent, fontSize: 9, fontWeight: '900' },
-  clubModalEventCopy: { flex: 1 },
-  clubModalEventTitle: { color: '#FFFFFF', fontSize: 11, fontWeight: '900' },
+  clubModalEventCopy: { paddingHorizontal: 11, paddingTop: 10, paddingBottom: 11 },
+  clubModalEventTitle: { color: '#FFFFFF', fontSize: 12, lineHeight: 15, fontWeight: '900' },
   clubModalEventMeta: { color: '#BFD0D6', fontSize: 9, fontWeight: '700', marginTop: 3 },
+  clubJoinInfoCard: { minHeight: 82, flexDirection: 'row', alignItems: 'center', gap: 12, marginHorizontal: 16, marginTop: 22, padding: 14, borderRadius: 16, backgroundColor: 'rgba(168,255,24,0.1)', borderWidth: 1, borderColor: 'rgba(168,255,24,0.32)' },
+  clubJoinInfoIcon: { width: 38, height: 38, borderRadius: 19, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.accent },
+  clubJoinInfoIconText: { color: '#06120e', fontSize: 22, lineHeight: 24, fontWeight: '900' },
+  clubJoinInfoCopy: { flex: 1 },
+  clubJoinInfoTitle: { color: '#FFFFFF', fontSize: 13, fontWeight: '900' },
+  clubJoinInfoText: { color: '#C8D9DE', fontSize: 10, lineHeight: 15, fontWeight: '700', marginTop: 5 },
   clubJoinButton: { height: 50, borderRadius: 16, alignItems: 'center', justifyContent: 'center', marginHorizontal: 16, marginTop: 22, backgroundColor: colors.accent },
   clubLeaveButton: { backgroundColor: 'rgba(255,255,255,0.08)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.28)' },
   clubJoinText: { color: '#06120e', fontSize: 14, fontWeight: '900' },
   clubLeaveText: { color: '#FFFFFF' },
-  clubVisitButton: { height: 48, borderRadius: 15, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginHorizontal: 16, marginTop: 22, paddingHorizontal: 16, backgroundColor: 'rgba(255,255,255,0.08)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.24)' },
-  clubVisitText: { color: '#FFFFFF', fontSize: 13, fontWeight: '900' },
-  clubVisitArrow: { color: colors.accent, fontSize: 25, lineHeight: 27 },
   clubPageRoot: { flex: 1, backgroundColor: '#071419' },
   clubPageContent: { paddingBottom: 42 },
   clubPageHero: { height: 330 },
@@ -1368,6 +2099,12 @@ const styles = StyleSheet.create({
   clubPageSectionTitle: { color: '#FFFFFF', fontSize: 16, fontWeight: '900' },
   clubPageSectionCount: { color: colors.accent, fontSize: 11, fontWeight: '900' },
   clubPageDescription: { color: '#C8D8DE', fontSize: 12, lineHeight: 19, fontWeight: '700', marginTop: 10 },
+  clubPageContact: { color: '#EAF5F7', fontSize: 12, lineHeight: 18, fontWeight: '800', marginTop: 10, borderRadius: 13, paddingHorizontal: 12, paddingVertical: 11, backgroundColor: 'rgba(255,255,255,0.08)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.14)' },
+  clubSocialRow: { flexDirection: 'row', gap: 10, marginTop: 11 },
+  clubSocialButton: { width: 42, height: 42, borderRadius: 21, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: 'rgba(255,255,255,0.36)', shadowColor: '#000', shadowOpacity: 0.28, shadowRadius: 10, shadowOffset: { width: 0, height: 5 } },
+  clubSocialButtonDisabled: { opacity: 0.82 },
+  clubSocialIcon: { fontSize: 16, fontWeight: '900' },
+  clubSocialWebIcon: { fontSize: 10, letterSpacing: 0 },
   clubPageEvent: { minHeight: 126, flexDirection: 'row', gap: 12, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.12)' },
   clubPageEventImageWrap: { width: 96, height: 96 },
   clubPageEventImage: { borderRadius: 10 },
@@ -1407,6 +2144,10 @@ const styles = StyleSheet.create({
   eventDetailMetaValue: { color: '#FFFFFF', fontSize: 10, fontWeight: '900', textAlign: 'center' },
   eventDetailMetaLabel: { color: '#AFC1C8', fontSize: 7, fontWeight: '800', marginTop: 4 },
   eventDetailMetaDivider: { width: 1, height: 34, backgroundColor: 'rgba(255,255,255,0.15)' },
+  eventDetailQuickGrid: { flexDirection: 'row', gap: 10, marginHorizontal: 15, marginTop: 12 },
+  eventDetailQuickItem: { flex: 1, minHeight: 72, borderRadius: 14, padding: 12, justifyContent: 'space-between', backgroundColor: 'rgba(57,255,136,0.08)', borderWidth: 1, borderColor: 'rgba(57,255,136,0.18)' },
+  eventDetailQuickValue: { color: '#FFFFFF', fontSize: 13, fontWeight: '900' },
+  eventDetailQuickLabel: { color: '#9FB4BC', fontSize: 8, fontWeight: '900', textTransform: 'uppercase' },
   eventDetailSection: { marginHorizontal: 17, marginTop: 22 },
   eventDetailSectionTitle: { color: '#FFFFFF', fontSize: 15, fontWeight: '900', marginBottom: 10 },
   eventDetailDescription: { color: '#C7D7DD', fontSize: 12, lineHeight: 19, fontWeight: '700' },
@@ -1419,6 +2160,18 @@ const styles = StyleSheet.create({
   eventDetailJoined: { backgroundColor: 'rgba(255,255,255,0.08)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.24)' },
   eventDetailJoinText: { color: '#06120e', fontSize: 13, fontWeight: '900' },
   eventDetailJoinedText: { color: '#FFFFFF' },
+  eventSuccessRoot: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 22 },
+  eventSuccessBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,6,9,0.72)' },
+  eventSuccessCard: { width: '100%', maxWidth: 360, borderRadius: 22, padding: 22, alignItems: 'center', backgroundColor: '#071419', borderWidth: 1, borderColor: 'rgba(255,255,255,0.22)' },
+  eventSuccessMark: { width: 54, height: 54, borderRadius: 27, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.accent },
+  eventSuccessMarkText: { color: '#06120e', fontSize: 28, fontWeight: '900' },
+  eventSuccessTitle: { color: '#FFFFFF', fontSize: 22, fontWeight: '900', marginTop: 16 },
+  eventSuccessBody: { color: '#C7D7DD', fontSize: 13, fontWeight: '800', textAlign: 'center', marginTop: 7 },
+  clubSuccessTitle: { color: '#FFFFFF', fontSize: 18, lineHeight: 23, fontWeight: '900', textAlign: 'center', marginTop: 14 },
+  clubSuccessBody: { color: '#C7D7DD', fontSize: 11, lineHeight: 16, fontWeight: '800', textAlign: 'center', marginTop: 8, paddingHorizontal: 4 },
+  eventSuccessEvent: { color: colors.accent, fontSize: 12, fontWeight: '900', textAlign: 'center', marginTop: 13 },
+  eventSuccessButton: { height: 46, alignSelf: 'stretch', borderRadius: 14, alignItems: 'center', justifyContent: 'center', marginTop: 20, backgroundColor: colors.accent },
+  eventSuccessButtonText: { color: '#06120e', fontSize: 13, fontWeight: '900' },
   galleryLightbox: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#020506' },
   galleryLightboxBackdrop: { ...StyleSheet.absoluteFillObject },
   galleryLightboxImage: { width: '100%', height: '78%' },
