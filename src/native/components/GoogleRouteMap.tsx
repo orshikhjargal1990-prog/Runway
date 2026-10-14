@@ -20,50 +20,13 @@ type Props = {
   focusCoordinate?: GoogleRoute['center'];
   fitRoute?: boolean;
   compactControls?: boolean;
+  showRouteInfo?: boolean;
 };
 
-const VIEWBOX_SIZE = 1000;
 const MAP_LATITUDE_DELTA = 0.032;
 const MAP_LONGITUDE_DELTA = 0.032;
 
-type ScreenPoint = {
-  x: number;
-  y: number;
-};
-
 type WebMapMode = 'hybrid' | 'standard' | 'satellite';
-
-function projectPoint(point: GoogleRoute['coordinates'][number]) {
-  const sinLatitude = Math.sin((point.latitude * Math.PI) / 180);
-
-  return {
-    x: (point.longitude + 180) / 360,
-    y: 0.5 - Math.log((1 + sinLatitude) / (1 - sinLatitude)) / (4 * Math.PI)
-  };
-}
-
-function getCoordinatePath(route: GoogleRoute, coordinates: GoogleRoute['coordinates']): ScreenPoint[] {
-  const center = projectPoint(route.center);
-  const northWest = projectPoint({
-    latitude: route.center.latitude + MAP_LATITUDE_DELTA / 2,
-    longitude: route.center.longitude - MAP_LONGITUDE_DELTA / 2
-  });
-  const southEast = projectPoint({
-    latitude: route.center.latitude - MAP_LATITUDE_DELTA / 2,
-    longitude: route.center.longitude + MAP_LONGITUDE_DELTA / 2
-  });
-  const width = southEast.x - northWest.x || 1;
-  const height = southEast.y - northWest.y || 1;
-
-  return coordinates.map(point => {
-    const projected = projectPoint(point);
-
-    return {
-      x: VIEWBOX_SIZE / 2 + ((projected.x - center.x) / width) * VIEWBOX_SIZE,
-      y: VIEWBOX_SIZE / 2 + ((projected.y - center.y) / height) * VIEWBOX_SIZE
-    };
-  });
-}
 
 function getRouteCenter(coordinates: GoogleRoute['coordinates'], fallback: GoogleRoute['center']) {
   if (!coordinates.length) return fallback;
@@ -71,27 +34,274 @@ function getRouteCenter(coordinates: GoogleRoute['coordinates'], fallback: Googl
   return { latitude: totals.latitude / coordinates.length, longitude: totals.longitude / coordinates.length };
 }
 
-export function GoogleRouteMap({ route, liveCoordinates = [], focusCoordinate, fitRoute = false, compactControls = false }: Props) {
-  const [mapMode, setMapMode] = useState<WebMapMode>('hybrid');
+function escapeHtmlJson(value: unknown) {
+  return JSON.stringify(value).replace(/</g, '\\u003c');
+}
+
+export function GoogleRouteMap({ route, liveCoordinates = [], focusCoordinate, fitRoute = false, compactControls = false, showRouteInfo = true }: Props) {
+  const [mapMode, setMapMode] = useState<WebMapMode>('satellite');
   const [drawingMode, setDrawingMode] = useState(false);
   const [plannedCoordinates, setPlannedCoordinates] = useState<GoogleRoute['coordinates']>([]);
   const [browserFocusCoordinate, setBrowserFocusCoordinate] = useState<GoogleRoute['center'] | null>(null);
   const [threeDimensional, setThreeDimensional] = useState(false);
+  const [mapHeading, setMapHeading] = useState(0);
   const [controlStatus, setControlStatus] = useState('');
   const statusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mapCenter = fitRoute ? getRouteCenter(liveCoordinates, route.center) : liveCoordinates[liveCoordinates.length - 1] ?? focusCoordinate ?? route.center;
   const displayedCenter = browserFocusCoordinate ?? mapCenter;
   const mapZoom = fitRoute ? 14 : browserFocusCoordinate || (focusCoordinate && liveCoordinates.length === 0) ? 18 : threeDimensional ? 17 : 15;
-  const mapTypeParam = mapMode === 'hybrid' ? '&t=h' : mapMode === 'satellite' ? '&t=k' : '&t=m';
-  const url = `https://www.google.com/maps?ll=${displayedCenter.latitude},${displayedCenter.longitude}&z=${mapZoom}${mapTypeParam}&output=embed`;
-  const liveRoutePath = getCoordinatePath(route, liveCoordinates);
-  const livePoints = liveRoutePath.map(point => `${point.x},${point.y}`).join(' ');
-  const liveStartPoint = liveRoutePath[0];
-  const liveEndPoint = liveRoutePath[liveRoutePath.length - 1];
-  const plannedRoutePath = getCoordinatePath(route, plannedCoordinates);
-  const plannedPoints = plannedRoutePath.map(point => `${point.x},${point.y}`).join(' ');
-  const plannedStartPoint = plannedRoutePath[0];
-  const plannedEndPoint = plannedRoutePath[plannedRoutePath.length - 1];
+  const routeCoordinates = route.coordinates ?? [];
+  const mapHtml = `
+    <!doctype html>
+    <html>
+      <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+        <style>
+          html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #07121A; }
+          #map {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            width: 160vmax;
+            height: 160vmax;
+            background: #07121A;
+            transform-origin: 50% 50%;
+            transform: translate(-50%, -50%) rotateZ(${mapHeading}deg);
+            transition: transform 360ms ease, filter 360ms ease;
+          }
+          body.three-d #map {
+            transform: translate(-50%, -50%) perspective(900px) rotateX(12deg) rotateZ(${mapHeading}deg) scale(1.08);
+            filter: saturate(1.16) contrast(1.06);
+          }
+          .leaflet-control-attribution { display: none; }
+          .leaflet-container { font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+          .pin {
+            width: 18px;
+            height: 18px;
+            border-radius: 999px;
+            border: 4px solid #fff;
+            box-shadow: 0 8px 24px rgba(0,0,0,.42);
+          }
+          .start { background: ${colors.accent}; border-color: #FFFFFF; }
+          .finish { background: #FFFFFF; border-color: ${colors.accent}; }
+          .live { width: 20px; height: 20px; background: ${colors.routeCompleted}; }
+          .route-name-label {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            width: max-content;
+            max-width: 210px;
+            padding: 8px 10px;
+            border-radius: 14px;
+            background: rgba(5,17,22,.9);
+            border: 1px solid rgba(255,255,255,.22);
+            box-shadow: 0 12px 28px rgba(0,0,0,.34);
+            color: #fff;
+            font-size: 11px;
+            font-weight: 900;
+            line-height: 1.15;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+          }
+          .route-name-pin {
+            width: 15px;
+            height: 15px;
+            border-radius: 999px 999px 999px 3px;
+            transform: rotate(-45deg);
+            background: ${colors.accent};
+            border: 2px solid #fff;
+            flex: none;
+          }
+          .route-name-label span {
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+          }
+        </style>
+      </head>
+      <body class="${threeDimensional ? 'three-d' : ''}">
+        <div id="map"></div>
+        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+        <script>
+          const center = ${escapeHtmlJson(displayedCenter)};
+          const route = ${escapeHtmlJson(routeCoordinates)};
+          const live = ${escapeHtmlJson(liveCoordinates)};
+          const planned = ${escapeHtmlJson(plannedCoordinates)};
+          const routeTitle = ${escapeHtmlJson(route.title)};
+          const routeCenter = ${escapeHtmlJson(route.center)};
+          const showRouteInfo = ${showRouteInfo ? 'true' : 'false'};
+          const mapMode = '${mapMode}';
+          const tileUrl = mapMode === 'satellite'
+            ? 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
+            : mapMode === 'hybrid'
+              ? 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png'
+              : 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+          const mapElement = document.getElementById('map');
+          const resizeMapCanvas = () => {
+            if (!mapElement) return;
+            const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 360;
+            const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 720;
+            const side = Math.ceil(Math.hypot(viewportWidth, viewportHeight) * 1.18);
+            mapElement.style.width = side + 'px';
+            mapElement.style.height = side + 'px';
+          };
+          resizeMapCanvas();
+          const map = L.map('map', {
+            zoomControl: false,
+            attributionControl: false,
+            tap: true,
+            touchZoom: true,
+            dragging: true,
+            scrollWheelZoom: true
+          }).setView([center.latitude, center.longitude], ${mapZoom});
+          window.setTimeout(() => map.invalidateSize(), 80);
+          window.addEventListener('resize', () => {
+            resizeMapCanvas();
+            window.setTimeout(() => map.invalidateSize(), 60);
+          });
+          window.addEventListener('orientationchange', () => {
+            window.setTimeout(() => {
+              resizeMapCanvas();
+              map.invalidateSize();
+            }, 120);
+          });
+          L.tileLayer(tileUrl, { maxZoom: 19, detectRetina: true }).addTo(map);
+          map.createPane('runboostRouteOverlay');
+          map.getPane('runboostRouteOverlay').style.zIndex = 660;
+          map.getPane('runboostRouteOverlay').style.pointerEvents = 'none';
+          map.createPane('runboostPointOverlay');
+          map.getPane('runboostPointOverlay').style.zIndex = 670;
+          map.getPane('runboostPointOverlay').style.pointerEvents = 'none';
+          const toLatLngs = points => points.map(point => [point.latitude, point.longitude]);
+          const lineLayers = [];
+          const pointLayers = [];
+          const labelElements = [];
+          const scaledWeight = (base) => {
+            const zoom = map.getZoom();
+            const scale = Math.max(0.42, Math.min(1.12, 1 - (15 - zoom) * 0.16));
+            return Math.max(2, Math.round(base * scale));
+          };
+          const scaledPointRadius = (base) => {
+            const zoom = map.getZoom();
+            const scale = Math.max(0.32, Math.min(1, 1 - (15 - zoom) * 0.2));
+            return Math.max(3, Math.round(base * scale));
+          };
+          const addScaledLine = (latLngs, options) => {
+            const layer = L.polyline(latLngs, { ...options, pane: 'runboostRouteOverlay', interactive: false, weight: scaledWeight(options.baseWeight) }).addTo(map);
+            lineLayers.push({ layer, baseWeight: options.baseWeight });
+            return layer;
+          };
+          const refreshLineWeights = () => {
+            lineLayers.forEach(item => item.layer.setStyle({ weight: scaledWeight(item.baseWeight) }));
+            pointLayers.forEach(item => item.layer.setStyle({ radius: scaledPointRadius(item.baseRadius), weight: Math.max(2, Math.round(3 * Math.max(0.55, scaledPointRadius(item.baseRadius) / item.baseRadius))) }));
+            const labelScale = Math.max(0.48, Math.min(1, scaledPointRadius(10) / 10));
+            labelElements.forEach(element => {
+              element.style.transformOrigin = '0 100%';
+              element.style.transform = 'scale(' + labelScale + ')';
+            });
+          };
+          const routeLatLngs = toLatLngs(route);
+          const liveLatLngs = toLatLngs(live);
+          const plannedLatLngs = toLatLngs(planned);
+          const escapeLabel = value => String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
+          const addPoint = (latLng, options) => {
+            const layer = L.circleMarker(latLng, {
+              pane: 'runboostPointOverlay',
+              interactive: false,
+              radius: scaledPointRadius(options.radius),
+              color: options.stroke,
+              weight: 3,
+              opacity: 1,
+              fillColor: options.fill,
+              fillOpacity: 1
+            }).addTo(map);
+            pointLayers.push({ layer, baseRadius: options.radius });
+          };
+          const addRouteNameLabel = () => {
+            if (!showRouteInfo || !routeTitle) return;
+            const label = L.divIcon({
+              className: '',
+              html: '<div class="route-name-label"><i class="route-name-pin"></i><span>' + escapeLabel(routeTitle) + '</span></div>',
+              iconSize: null,
+              iconAnchor: [18, 44]
+            });
+            L.marker([routeCenter.latitude, routeCenter.longitude], {
+              icon: label,
+              pane: 'runboostPointOverlay',
+              interactive: false,
+              keyboard: false
+            }).addTo(map).on('add', event => {
+              const element = event.target.getElement()?.querySelector('.route-name-label');
+              if (element) {
+                labelElements.push(element);
+                refreshLineWeights();
+              }
+            });
+          };
+
+          if (routeLatLngs.length > 1) {
+            addScaledLine(routeLatLngs, { color: '${colors.accent}', baseWeight: 10, opacity: 1, lineCap: 'round', lineJoin: 'round' });
+            if (!liveLatLngs.length) {
+              addPoint(routeLatLngs[0], { fill: '${colors.accent}', stroke: '#FFFFFF', radius: 9 });
+              addPoint(routeLatLngs[routeLatLngs.length - 1], { fill: '#FFFFFF', stroke: '${colors.accent}', radius: 9 });
+            }
+          }
+
+          if (plannedLatLngs.length > 1) {
+            addScaledLine(plannedLatLngs, { color: '#FF5A1F', baseWeight: 8, opacity: 1, lineCap: 'round', lineJoin: 'round' });
+          }
+
+          if (liveLatLngs.length > 1) {
+            addScaledLine(liveLatLngs, { color: '${colors.routeActive}', baseWeight: 7, opacity: 1, lineCap: 'round', lineJoin: 'round' });
+            addPoint(liveLatLngs[0], { fill: '${colors.routeActive}', stroke: '#FFFFFF', radius: 8 });
+            addPoint(liveLatLngs[liveLatLngs.length - 1], { fill: '${colors.routeCompleted}', stroke: '#FFFFFF', radius: 10 });
+          }
+          addRouteNameLabel();
+
+          const fitLatLngs = ${fitRoute ? 'true' : 'false'} && (liveLatLngs.length > 1 ? liveLatLngs : routeLatLngs);
+          if (fitLatLngs && fitLatLngs.length > 1) {
+            map.fitBounds(fitLatLngs, { padding: [58, 58], maxZoom: 16 });
+          }
+          refreshLineWeights();
+          map.on('zoomend', refreshLineWeights);
+
+          let heading = ${mapHeading};
+          let rotateGesture = null;
+          const touchAngle = touches => Math.atan2(
+            touches[1].clientY - touches[0].clientY,
+            touches[1].clientX - touches[0].clientX
+          ) * 180 / Math.PI;
+          const applyHeading = animated => {
+            if (!mapElement) return;
+            mapElement.style.transition = animated ? 'transform 360ms ease, filter 360ms ease' : 'none';
+            mapElement.style.transform = document.body.classList.contains('three-d')
+              ? 'translate(-50%, -50%) perspective(900px) rotateX(12deg) rotateZ(' + heading + 'deg) scale(1.08)'
+              : 'translate(-50%, -50%) rotateZ(' + heading + 'deg)';
+          };
+          mapElement?.addEventListener('touchstart', event => {
+            if (event.touches.length === 2) {
+              rotateGesture = { angle: touchAngle(event.touches), heading };
+              applyHeading(false);
+            }
+          }, { passive: true });
+          mapElement?.addEventListener('touchmove', event => {
+            if (event.touches.length === 2 && rotateGesture) {
+              heading = (rotateGesture.heading + touchAngle(event.touches) - rotateGesture.angle + 360) % 360;
+              applyHeading(false);
+            }
+          }, { passive: true });
+          mapElement?.addEventListener('touchend', event => {
+            if (event.touches.length < 2) {
+              rotateGesture = null;
+              applyHeading(true);
+            }
+          }, { passive: true });
+        </script>
+      </body>
+    </html>
+  `;
   const drawingCursor = drawingMode ? 'crosshair' : 'auto';
   const mapModeLabel = mapMode === 'hybrid' ? 'H' : mapMode === 'standard' ? 'M' : 'S';
 
@@ -113,6 +323,7 @@ export function GoogleRouteMap({ route, liveCoordinates = [], focusCoordinate, f
 
   const resetOrientation = () => {
     setThreeDimensional(false);
+    setMapHeading(0);
     setBrowserFocusCoordinate(null);
     showStatus('Маршрутын төвд шилжлээ');
   };
@@ -185,116 +396,17 @@ export function GoogleRouteMap({ route, liveCoordinates = [], focusCoordinate, f
   return (
     <View style={styles.root}>
       {React.createElement('iframe' as never, {
-        key: url,
+        key: `${mapMode}-${threeDimensional ? '3d' : '2d'}-${mapHeading}-${displayedCenter.latitude}-${displayedCenter.longitude}-${routeCoordinates.length}-${liveCoordinates.length}-${plannedCoordinates.length}-${fitRoute ? 'fit' : 'free'}`,
         allowFullScreen: true,
-        src: url,
+        srcDoc: mapHtml,
         style: {
-          ...styles.iframe,
-          transform: threeDimensional ? 'perspective(900px) rotateX(12deg) scale(1.12)' : 'none',
-          transition: 'transform 360ms ease'
+          ...styles.iframe
         },
         loading: 'lazy',
         referrerPolicy: 'no-referrer-when-downgrade',
         title: route.title
       })}
       <View pointerEvents="none" style={styles.embedLinkCover} />
-      {React.createElement(
-        'svg' as never,
-        {
-          viewBox: `0 0 ${VIEWBOX_SIZE} ${VIEWBOX_SIZE}`,
-          preserveAspectRatio: 'none',
-          style: styles.routeOverlay
-        },
-        React.createElement(
-          React.Fragment,
-          null,
-          plannedRoutePath.length > 1
-            ? React.createElement(
-                React.Fragment,
-                null,
-                React.createElement('polyline' as never, {
-                  points: plannedPoints,
-                  fill: 'none',
-                  stroke: 'rgba(0, 0, 0, 0.72)',
-                  strokeLinecap: 'round',
-                  strokeLinejoin: 'round',
-                  strokeWidth: 34
-                }),
-                React.createElement('polyline' as never, {
-                  points: plannedPoints,
-                  fill: 'none',
-                  stroke: '#FF5A1F',
-                  strokeLinecap: 'round',
-                  strokeLinejoin: 'round',
-                  strokeWidth: 20
-                }),
-                React.createElement('circle' as never, {
-                  cx: plannedStartPoint.x,
-                  cy: plannedStartPoint.y,
-                  fill: '#FF5A1F',
-                  r: 25,
-                  stroke: '#ffffff',
-                  strokeWidth: 7
-                }),
-                React.createElement('circle' as never, {
-                  cx: plannedEndPoint.x,
-                  cy: plannedEndPoint.y,
-                  fill: colors.accent,
-                  r: 25,
-                  stroke: '#ffffff',
-                  strokeWidth: 7
-                })
-              )
-            : plannedRoutePath.length === 1
-              ? React.createElement('circle' as never, {
-                  cx: plannedStartPoint.x,
-                  cy: plannedStartPoint.y,
-                  fill: '#FF5A1F',
-                  r: 25,
-                  stroke: '#ffffff',
-                  strokeWidth: 7
-                })
-              : null,
-          liveRoutePath.length > 1
-          ? React.createElement(
-              React.Fragment,
-              null,
-              React.createElement('polyline' as never, {
-                points: livePoints,
-                fill: 'none',
-                stroke: 'rgba(0, 0, 0, 0.62)',
-                strokeLinecap: 'round',
-                strokeLinejoin: 'round',
-                strokeWidth: 38
-              }),
-              React.createElement('polyline' as never, {
-                points: livePoints,
-                fill: 'none',
-                stroke: colors.routeActive,
-                strokeLinecap: 'round',
-                strokeLinejoin: 'round',
-                strokeWidth: 22
-              }),
-              React.createElement('circle' as never, {
-                cx: liveStartPoint.x,
-                cy: liveStartPoint.y,
-                fill: colors.routeActive,
-                r: 30,
-                stroke: '#ffffff',
-                strokeWidth: 9
-              }),
-              React.createElement('circle' as never, {
-                cx: liveEndPoint.x,
-                cy: liveEndPoint.y,
-                fill: '#ffffff',
-                r: 30,
-                stroke: colors.routeCompleted,
-                strokeWidth: 9
-              })
-            )
-          : null
-        )
-      )}
       {drawingMode
         ? React.createElement('div' as never, {
             onClick: addPlannedPoint,

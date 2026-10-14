@@ -7,6 +7,7 @@ import {
   KeyboardAvoidingView,
   Platform,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
@@ -25,7 +26,6 @@ import {
 type Props = {
   onLogin: (email: string, password: string) => Promise<AuthResult>;
   onRegister: (name: string, email: string, password: string) => Promise<AuthResult>;
-  onQuickLogin: () => void;
 };
 
 type AuthMode = 'login' | 'register';
@@ -35,7 +35,7 @@ type AuthResult = {
   message?: string;
 };
 
-export function LoginScreen({ onLogin, onRegister, onQuickLogin }: Props) {
+export function LoginScreen({ onLogin, onRegister }: Props) {
   const insets = useSafeAreaInsets();
   const [mode, setMode] = useState<AuthMode>('register');
   const [name, setName] = useState('');
@@ -102,6 +102,9 @@ export function LoginScreen({ onLogin, onRegister, onQuickLogin }: Props) {
   const switchMode = (nextMode: AuthMode) => {
     setMode(nextMode);
     setError('');
+    setName('');
+    setEmail('');
+    setPassword('');
     setAuthOpen(true);
   };
 
@@ -115,10 +118,6 @@ export function LoginScreen({ onLogin, onRegister, onQuickLogin }: Props) {
     }).start(({ finished }) => {
       if (finished) setAuthOpen(false);
     });
-  };
-
-  const quickLogin = () => {
-    onQuickLogin();
   };
 
   const slideTextMotion = {
@@ -175,6 +174,7 @@ export function LoginScreen({ onLogin, onRegister, onQuickLogin }: Props) {
 
   return (
     <View style={styles.root}>
+      {Platform.OS === 'web' ? <style dangerouslySetInnerHTML={{ __html: webInputCss }} /> : null}
       <LoginMedia slide={activeSlide} />
       <View style={styles.imageDim} />
       <LinearGradient
@@ -192,11 +192,17 @@ export function LoginScreen({ onLogin, onRegister, onQuickLogin }: Props) {
       </View>
 
       <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 18}
         style={[styles.content, { paddingBottom: Math.max(insets.bottom + 22, 34) }]}
       >
-        {!authOpen ? (
-          <>
+        <ScrollView
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={[styles.contentScroll, authOpen && styles.contentScrollAuth]}
+        >
+          {!authOpen ? (
+            <>
             <Animated.View style={slideTextMotion}>
               <View style={styles.storyHeader}>
                 <View style={styles.eyebrowRow}>
@@ -225,66 +231,82 @@ export function LoginScreen({ onLogin, onRegister, onQuickLogin }: Props) {
             </View>
 
             <View style={styles.landingActions}>
-              <Pressable style={styles.loginButton} onPress={quickLogin}>
+              <Pressable style={styles.loginButton} onPress={() => switchMode('login')}>
                 <Text style={styles.loginButtonText}>Нэвтрэх</Text>
               </Pressable>
               <Pressable style={styles.getStartedButton} onPress={() => switchMode('register')}>
-                <Text style={styles.getStartedText}>Эхлэх</Text>
+                <Text style={styles.getStartedText}>Бүртгүүлэх</Text>
               </Pressable>
             </View>
-          </>
-        ) : (
-          <Animated.View style={[styles.authPanel, authPanelMotion]}>
+            </>
+          ) : (
+            <Animated.View style={[styles.authPanel, authPanelMotion]}>
             <View style={styles.authHeader}>
-              <View><Text style={styles.authEyebrow}>RUNBOOST</Text><Text style={styles.authTitle}>{mode === 'register' ? 'Бүртгэл үүсгэх' : 'Тавтай морил'}</Text></View>
+              <View style={styles.authTitleBlock}>
+                <Text style={styles.authEyebrow}>RUNBOOST</Text>
+                <Text style={styles.authTitle}>{mode === 'register' ? 'Бүртгэл үүсгэх' : 'Тавтай морил'}</Text>
+                <Text style={styles.authSubtitle}>{mode === 'register' ? 'Профайлаа үүсгээд чэлленжүүдэд бүртгүүлээрэй.' : 'Өөрийн гүйлт, клуб, бүртгэлүүдээ үргэлжлүүлнэ үү.'}</Text>
+              </View>
               <Pressable accessibilityLabel="Форм хаах" style={styles.closeButton} onPress={closeAuth}><Text style={styles.closeText}>×</Text></Pressable>
             </View>
 
             <View style={styles.form}>
               {mode === 'register' && (
-                <TextInput
-                  value={name}
-                  onChangeText={setName}
-                  placeholder="Таны нэр"
-                  placeholderTextColor="rgba(255,255,255,0.48)"
-                  autoCapitalize="words"
-                  autoCorrect={false}
-                  style={styles.input}
-                />
+                <View style={styles.fieldWrap}>
+                  <Text style={styles.fieldLabel}>Нэр</Text>
+                  <TextInput
+                    value={name}
+                    onChangeText={setName}
+                    placeholder="Таны нэр"
+                    placeholderTextColor="rgba(222,244,229,0.46)"
+                    autoComplete="off"
+                    autoCapitalize="words"
+                    autoCorrect={false}
+                    style={[styles.input, webInputReset]}
+                  />
+                </View>
               )}
 
-              <TextInput
-                value={email}
-                onChangeText={setEmail}
-                placeholder="Имэйл хаяг"
-                placeholderTextColor="rgba(255,255,255,0.48)"
-                keyboardType="email-address"
-                textContentType="emailAddress"
-                autoCapitalize="none"
-                autoCorrect={false}
-                style={styles.input}
-              />
-
-              <View style={styles.passwordField}>
+              <View style={styles.fieldWrap}>
+                <Text style={styles.fieldLabel}>Имэйл</Text>
                 <TextInput
-                  value={password}
-                  onChangeText={setPassword}
-                  placeholder="Нууц үг"
-                  placeholderTextColor="rgba(255,255,255,0.48)"
-                  textContentType={mode === 'register' ? 'newPassword' : 'password'}
-                  secureTextEntry={!isPasswordVisible}
-                  style={styles.passwordInput}
-                  onSubmitEditing={submit}
+                  value={email}
+                  onChangeText={setEmail}
+                  placeholder="name@example.com"
+                  placeholderTextColor="rgba(222,244,229,0.46)"
+                  keyboardType="email-address"
+                  autoComplete="off"
+                  textContentType="none"
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  style={[styles.input, webInputReset]}
                 />
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel={isPasswordVisible ? 'Нууц үг нуух' : 'Нууц үг харах'}
-                  hitSlop={10}
-                  style={styles.passwordToggle}
-                  onPress={() => setIsPasswordVisible(current => !current)}
-                >
-                  <Text style={styles.passwordToggleText}>{isPasswordVisible ? 'Нуух' : 'Харах'}</Text>
-                </Pressable>
+              </View>
+
+              <View style={styles.fieldWrap}>
+                <Text style={styles.fieldLabel}>Нууц үг</Text>
+                <View style={styles.passwordField}>
+                  <TextInput
+                    value={password}
+                    onChangeText={setPassword}
+                    placeholder="6+ тэмдэгт"
+                    placeholderTextColor="rgba(222,244,229,0.46)"
+                    autoComplete="off"
+                    textContentType="none"
+                    secureTextEntry={!isPasswordVisible}
+                    style={[styles.passwordInput, webInputReset]}
+                    onSubmitEditing={submit}
+                  />
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel={isPasswordVisible ? 'Нууц үг нуух' : 'Нууц үг харах'}
+                    hitSlop={10}
+                    style={styles.passwordToggle}
+                    onPress={() => setIsPasswordVisible(current => !current)}
+                  >
+                    <Text style={styles.passwordToggleText}>{isPasswordVisible ? 'Нуух' : 'Харах'}</Text>
+                  </Pressable>
+                </View>
               </View>
 
               {error ? <Text style={styles.error}>{error}</Text> : null}
@@ -297,8 +319,9 @@ export function LoginScreen({ onLogin, onRegister, onQuickLogin }: Props) {
             <Pressable style={styles.switchLink} onPress={() => switchMode(mode === 'register' ? 'login' : 'register')}>
               <Text style={styles.switchLinkText}>{mode === 'register' ? 'Бүртгэлтэй юу? Нэвтрэх' : 'Шинэ хэрэглэгч үү? Бүртгүүлэх'}</Text>
             </Pressable>
-          </Animated.View>
-        )}
+            </Animated.View>
+          )}
+        </ScrollView>
       </KeyboardAvoidingView>
     </View>
   );
@@ -333,6 +356,31 @@ const webVideoStyle: React.CSSProperties = {
   height: '100%',
   objectFit: 'cover'
 };
+
+const webInputReset = Platform.OS === 'web'
+  ? ({
+    backgroundColor: 'transparent'
+  } as const)
+  : null;
+
+const webInputCss = `
+input,
+textarea {
+  background: transparent !important;
+  box-shadow: none !important;
+  outline: none !important;
+}
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+textarea:-webkit-autofill {
+  -webkit-box-shadow: 0 0 0 1000px rgba(7,18,16,0.96) inset !important;
+  -webkit-text-fill-color: #ffffff !important;
+  caret-color: #ffffff !important;
+  border-radius: 0 !important;
+  transition: background-color 9999s ease-out 0s !important;
+}
+`;
 
 const styles = StyleSheet.create({
   root: {
@@ -398,8 +446,16 @@ const styles = StyleSheet.create({
     width: '100%',
     maxWidth: 460,
     alignSelf: 'center',
-    justifyContent: 'flex-end',
     paddingHorizontal: 20
+  },
+  contentScroll: {
+    flexGrow: 1,
+    justifyContent: 'flex-end',
+    paddingTop: 16
+  },
+  contentScrollAuth: {
+    justifyContent: 'flex-end',
+    paddingTop: 36
   },
   storyHeader: {
     flexDirection: 'row',
@@ -499,35 +555,52 @@ const styles = StyleSheet.create({
     fontWeight: '900'
   },
   authPanel: {
-    borderRadius: 22,
-    backgroundColor: 'rgba(8,11,9,0.91)',
+    borderRadius: 26,
+    backgroundColor: 'rgba(5,12,10,0.82)',
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.18)',
-    padding: 16
+    borderColor: 'rgba(226,255,214,0.2)',
+    padding: 18,
+    shadowColor: '#000000',
+    shadowOpacity: 0.36,
+    shadowRadius: 26,
+    shadowOffset: { width: 0, height: 18 }
   },
   authHeader: {
     flexDirection: 'row',
     alignItems: 'flex-start',
     justifyContent: 'space-between',
-    marginBottom: 15
+    marginBottom: 18
+  },
+  authTitleBlock: {
+    flex: 1,
+    paddingRight: 14
   },
   authEyebrow: {
     color: colors.lime,
     fontSize: 8,
     fontWeight: '900',
-    marginBottom: 4
+    marginBottom: 5
   },
   authTitle: {
     color: '#ffffff',
-    fontSize: 22,
+    fontSize: 24,
+    lineHeight: 29,
     fontWeight: '900'
   },
+  authSubtitle: {
+    color: 'rgba(232,244,236,0.66)',
+    fontSize: 12,
+    lineHeight: 17,
+    fontWeight: '700',
+    marginTop: 7
+  },
   closeButton: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
+    width: 34,
+    height: 34,
+    borderRadius: 17,
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.2)',
+    borderColor: 'rgba(255,255,255,0.22)',
+    backgroundColor: 'rgba(255,255,255,0.08)',
     alignItems: 'center',
     justifyContent: 'center'
   },
@@ -538,41 +611,56 @@ const styles = StyleSheet.create({
     fontWeight: '400'
   },
   form: {
-    gap: 8,
-    marginBottom: 10
+    gap: 10,
+    marginBottom: 12
+  },
+  fieldWrap: {
+    borderRadius: 20,
+    backgroundColor: 'rgba(7,18,16,0.66)',
+    borderWidth: 1,
+    borderColor: 'rgba(222,244,229,0.24)',
+    paddingHorizontal: 13,
+    paddingTop: 9,
+    paddingBottom: 8,
+    overflow: 'hidden'
+  },
+  fieldLabel: {
+    color: 'rgba(168,255,24,0.92)',
+    fontSize: 10,
+    fontWeight: '900',
+    marginBottom: 5
   },
   input: {
-    height: 48,
-    borderRadius: 24,
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.2)',
-    backgroundColor: 'rgba(255,255,255,0.08)',
+    height: 30,
+    borderRadius: 0,
+    borderWidth: 0,
+    backgroundColor: 'transparent',
     color: '#ffffff',
     fontSize: 14,
-    fontWeight: '700',
-    paddingHorizontal: 17
+    fontWeight: '800',
+    paddingHorizontal: 0,
+    paddingVertical: 0
   },
   passwordField: {
-    height: 48,
-    borderRadius: 24,
-    borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.2)',
-    backgroundColor: 'rgba(255,255,255,0.08)',
+    height: 30,
     flexDirection: 'row',
     alignItems: 'center',
-    paddingLeft: 17,
-    paddingRight: 6
+    paddingLeft: 0
   },
   passwordInput: {
     flex: 1,
     color: '#ffffff',
     fontSize: 14,
-    fontWeight: '700',
+    fontWeight: '800',
     paddingVertical: 0
   },
   passwordToggle: {
-    minWidth: 52,
-    height: 34,
+    minWidth: 56,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: 'rgba(168,255,24,0.12)',
+    borderWidth: 1,
+    borderColor: 'rgba(168,255,24,0.26)',
     alignItems: 'center',
     justifyContent: 'center'
   },
@@ -582,22 +670,31 @@ const styles = StyleSheet.create({
     fontWeight: '900'
   },
   error: {
-    color: '#ff8a8a',
-    fontSize: 11,
+    color: '#ffc2c2',
+    fontSize: 12,
     fontWeight: '800',
-    paddingHorizontal: 8
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    borderRadius: 14,
+    backgroundColor: 'rgba(255,70,70,0.13)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,120,120,0.22)'
   },
   primaryButton: {
-    height: 50,
-    borderRadius: 25,
-    backgroundColor: '#ffffff',
+    height: 52,
+    borderRadius: 18,
+    backgroundColor: colors.lime,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 16
+    paddingHorizontal: 18,
+    shadowColor: colors.lime,
+    shadowOpacity: 0.22,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 10 }
   },
   primaryText: {
-    color: '#121512',
+    color: '#102014',
     fontSize: 14,
     fontWeight: '900'
   },
@@ -605,18 +702,18 @@ const styles = StyleSheet.create({
     opacity: 0.62
   },
   primaryArrow: {
-    color: '#121512',
+    color: '#102014',
     fontSize: 20,
     fontWeight: '700'
   },
   switchLink: {
-    height: 34,
+    height: 38,
     alignItems: 'center',
     justifyContent: 'flex-end'
   },
   switchLinkText: {
-    color: 'rgba(255,255,255,0.68)',
-    fontSize: 11,
-    fontWeight: '700'
+    color: 'rgba(232,244,236,0.78)',
+    fontSize: 12,
+    fontWeight: '800'
   }
 });

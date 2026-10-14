@@ -13,8 +13,8 @@ type Props = {
 
 const tabs: { key: TabKey; label: string; icon: string }[] = [
   { key: 'home', label: 'Нүүр', icon: '⌂' },
-  { key: 'run', label: 'Гүйх', icon: '⌁' },
-  { key: 'explore', label: 'Routes', icon: '◇' },
+  { key: 'run', label: 'Гүйлт', icon: '⌁' },
+  { key: 'explore', label: 'Shop', icon: '◈' },
   { key: 'profile', label: 'Профайл', icon: '○' }
 ];
 
@@ -24,8 +24,8 @@ export function Shell({ activeTab, onTabChange, children }: Props) {
   return (
     <View style={styles.root}>
       <View style={styles.content}>{children}</View>
-      <View style={styles.tabs}>
-        <BlurView intensity={58} tint="dark" style={[styles.tabGlass, { paddingBottom: Math.max(insets.bottom, 10) }]}> 
+      <View style={[styles.tabs, { paddingBottom: Math.max(insets.bottom, 10) }]}>
+        <BlurView intensity={72} tint="dark" style={styles.tabGlass}>
           {tabs.map(tab => {
             const active = tab.key === activeTab;
             return (
@@ -48,31 +48,31 @@ const styles = StyleSheet.create({
   content: { flex: 1, minHeight: 0, overflow: 'hidden' },
   tabs: {
     position: 'absolute',
-    left: 0,
-    right: 0,
+    left: 12,
+    right: 12,
     bottom: 0,
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-    overflow: 'hidden',
-    backgroundColor: 'rgba(36,46,53,0.18)',
+    backgroundColor: 'transparent',
     shadowColor: '#000',
-    shadowOpacity: 0.32,
-    shadowRadius: 24,
-    shadowOffset: { width: 0, height: -10 }
+    shadowOpacity: 0.38,
+    shadowRadius: 22,
+    shadowOffset: { width: 0, height: 10 }
   },
   tabGlass: {
     flexDirection: 'row',
+    minHeight: 64,
     borderWidth: 1,
-    borderBottomWidth: 0,
-    borderColor: 'rgba(255,255,255,0.3)',
-    backgroundColor: 'rgba(30,40,47,0.48)',
-    paddingTop: 10,
-    paddingHorizontal: 10
+    borderColor: 'rgba(255,255,255,0.18)',
+    borderRadius: 24,
+    overflow: 'hidden',
+    backgroundColor: 'rgba(8,18,24,0.82)',
+    paddingTop: 8,
+    paddingHorizontal: 8,
+    paddingBottom: 8
   },
-  tab: { flex: 1, alignItems: 'center', gap: 3 },
-  iconWrap: { width: 34, height: 25, borderRadius: 13, alignItems: 'center', justifyContent: 'center' },
-  activeIconWrap: { backgroundColor: 'rgba(255,255,255,0.18)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.38)', shadowColor: '#ffffff', shadowOpacity: 0.2, shadowRadius: 12 },
-  icon: { color: colors.subtle, fontSize: 20, fontWeight: '900' },
-  label: { color: colors.subtle, fontSize: 10, fontWeight: '800' },
+  tab: { flex: 1, minHeight: 48, alignItems: 'center', justifyContent: 'center', gap: 3, borderRadius: 18 },
+  iconWrap: { width: 38, height: 27, borderRadius: 14, alignItems: 'center', justifyContent: 'center' },
+  activeIconWrap: { backgroundColor: 'rgba(168,255,24,0.16)', borderWidth: 1, borderColor: 'rgba(168,255,24,0.5)', shadowColor: colors.accent, shadowOpacity: 0.32, shadowRadius: 12 },
+  icon: { color: 'rgba(219,232,237,0.62)', fontSize: 19, fontWeight: '900' },
+  label: { color: 'rgba(219,232,237,0.62)', fontSize: 9, fontWeight: '900' },
   active: { color: colors.accent }
 });
